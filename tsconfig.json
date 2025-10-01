@@ -1,6 +1,6 @@
 {
   "compilerOptions": {
-    "outDir": "_.build",
+    "outDir": "dist",
     "rootDir": "src",
     "target": "esnext",
     "module": "commonjs",

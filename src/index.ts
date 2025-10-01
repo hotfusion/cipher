@@ -1,45 +1,16 @@
-// cipher-file-encrypted.ts
+// collection-file-encrypted.ts
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { split, combine } from 'shamir-secret-sharing';
-import * as express from 'express';
 import * as https from 'https';
+//@ts-ignore
+import * as _ from 'underscore';
+import Ajv from 'ajv';
+import { Shamir } from './shamir';
+import { EncryptedData, Encryption } from './encryption';
 
-class Shamir {
-    static async split(secret: Uint8Array, n: number, k: number): Promise<Uint8Array[]> {
-        return split(secret, n, k);
-    }
-
-    static async combine(shares: Uint8Array[]): Promise<Uint8Array> {
-        return combine(shares);
-    }
-}
-
-interface EncryptedData {
-    iv: string;
-    tag: string;
-    ciphertext: string;
-}
-
-class Encryption {
-    static encrypt(data: string, key: Buffer): EncryptedData {
-        const iv = crypto.randomBytes(12);
-        const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
-        const ciphertext = Buffer.concat([cipher.update(data, 'utf8'), cipher.final()]);
-        const tag = cipher.getAuthTag();
-        return { iv: iv.toString('hex'), tag: tag.toString('hex'), ciphertext: ciphertext.toString('hex') };
-    }
-
-    static decrypt({ iv, tag, ciphertext }: EncryptedData, key: Buffer): string {
-        const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(iv, 'hex'));
-        decipher.setAuthTag(Buffer.from(tag, 'hex'));
-        return Buffer.concat([decipher.update(Buffer.from(ciphertext, 'hex')), decipher.final()]).toString('utf8');
-    }
-}
-
-interface CipherOptions {
+export interface ICollectionOptions {
     numShares?: number;
     threshold?: number;
     persistent?: boolean;
@@ -47,36 +18,55 @@ interface CipherOptions {
     autoSaveInterval?: number;
     password?: string;
     auditLogPath?: string;
-    // For network support
     port?: number;
     tlsCertPath?: string;
     tlsKeyPath?: string;
 }
 
-class Cipher {
+// Define a type for system keys (e.g., ENCRYPTED_SEK)
+type SystemKey = { type: string };
+
+export class Collection<T extends object = any> {
+    // Update data to allow key to be Partial<T> or SystemKey
+    private data: Array<{
+        key: Partial<T> | SystemKey;
+        value: EncryptedData;
+        meta: { readonly: boolean };
+        created: number;
+        deleted: boolean;
+        version: number
+    }> = [];
     private numShares: number;
     private threshold: number;
     private persistent: boolean;
     private autoSaveInterval: number;
     private filePath: string;
     private auditLogPath: string;
-
     private masterKey: Buffer | null = null;
     private sek: Buffer | null = null;
     private locked: boolean = true;
     private shares: Uint8Array[] = [];
-    private secrets: Record<string, EncryptedData> = {};
     private _saveTimer: NodeJS.Timeout | null = null;
     private _encryptedVault: { iv: string; tag: string; ciphertext: string; hmac: string } | null = null;
     private passwordHash: string | null = null;
-
-    // For network support
     private server: https.Server | null = null;
     private port: number;
     private tlsCert: string | null = null;
     private tlsKey: string | null = null;
+    private ajv: Ajv;
+    private keySchemaValidator: any = null;
+    private valueSchemaValidator: any = null;
 
-    constructor(options: CipherOptions = {}) {
+    static collection<T extends object = any>(name: string, schema: { key?: object; value?: object } = {}, options: ICollectionOptions = {}) {
+        return new Collection<T>(name, schema, options);
+    }
+
+    constructor(
+        private collectionName: string,
+        private schema: { key?: object; value?: object },
+        options: ICollectionOptions = {}
+    ) {
+        // ... (constructor logic unchanged)
         this.numShares = options.numShares ?? 5;
         this.threshold = options.threshold ?? 3;
         this.persistent = options.persistent ?? false;
@@ -107,7 +97,6 @@ class Cipher {
             }
             this.auditLogPath = options.auditLogPath ?? path.join(path.dirname(this.filePath), 'audit.log');
 
-            // Load encrypted vault if exists
             if (fs.existsSync(this.filePath)) {
                 this._encryptedVault = JSON.parse(fs.readFileSync(this.filePath, 'utf-8'));
             }
@@ -116,7 +105,6 @@ class Cipher {
             this.auditLogPath = '';
         }
 
-        // Crash-safe flush
         if (this.persistent) {
             const flushOnExit = () => {
                 console.log('Flushing vault before exit...');
@@ -130,50 +118,41 @@ class Cipher {
                 process.exit(1);
             });
         }
+
+        this.ajv = new Ajv({ allErrors: true });
+        if (this.schema.key) {
+            this.keySchemaValidator = this.ajv.compile(this.schema.key);
+        }
+        if (this.schema.value) {
+            this.valueSchemaValidator = this.ajv.compile(this.schema.value);
+        }
     }
 
-    /**
-     * Initializes the Cipher by generating keys and splitting shares.
-     */
-    async init(): Promise<void> {
+    async init(): Promise<string[]> {
         this.masterKey = crypto.randomBytes(32);
         this.sek = crypto.randomBytes(32);
-
-        this.shares = await Shamir.split(this.masterKey, this.numShares, this.threshold);
-
-        // Encrypt SEK with master key
-        this.secrets['ENCRYPTED_SEK'] = Encryption.encrypt(this.sek.toString('hex'), this.masterKey);
+        this.shares = await Shamir.split(new Uint8Array(this.masterKey), this.numShares, this.threshold);
+        // Use SystemKey type for ENCRYPTED_SEK
+        this.data.push({
+            key: { type: 'ENCRYPTED_SEK' } as SystemKey,
+            value: Encryption.encrypt(this.sek.toString('hex'), this.masterKey),
+            meta: { readonly: true },
+            created: Date.now(),
+            deleted: false,
+            version: 1
+        });
 
         if (this.persistent) this._scheduleSave();
-
         this.locked = true;
-        console.log('Cipher initialized and locked. Distribute these shares:', this.shares.map(s => Buffer.from(s).toString('hex')));
+        console.log('Collection initialized and locked. Distribute these shares:', this.shares.map(s => Buffer.from(s).toString('hex')));
         this.logOperation('init', { timestamp: Date.now() });
+        return this.shares.map(s => Buffer.from(s).toString('hex'));
     }
 
-    /**
-     * Saves shares to individual files in the specified directory.
-     * @param outputDir Directory to save shares.
-     */
-    saveShares(outputDir: string): void {
-        if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
-        this.shares.forEach((share, i) => {
-            const filePath = path.join(outputDir, `share_${i + 1}.txt`);
-            fs.writeFileSync(filePath, Buffer.from(share).toString('hex'), 'utf8');
-        });
-        console.log(`Shares saved securely to ${outputDir}`);
-    }
-
-    /**
-     * Unlocks the Cipher using provided shares and optional password.
-     * @param providedShares Array of share strings (hex).
-     * @param password Optional password.
-     */
     async unlock(providedShares: string[], password?: string): Promise<void> {
         if (this.passwordHash && crypto.createHash('sha256').update(password ?? '').digest('hex') !== this.passwordHash) {
             throw new Error('Invalid password');
         }
-
         if (providedShares.length < this.threshold) {
             throw new Error(`Need at least ${this.threshold} shares to unlock`);
         }
@@ -181,101 +160,145 @@ class Cipher {
         const sharesUint8 = providedShares.map(s => Uint8Array.from(Buffer.from(s, 'hex')));
         this.masterKey = Buffer.from(await Shamir.combine(sharesUint8));
 
-        // If file exists, decrypt entire vault with integrity check
         if (this._encryptedVault) {
             const { iv, tag, ciphertext, hmac } = this._encryptedVault;
             const decryptedJson = Encryption.decrypt({ iv, tag, ciphertext }, this.masterKey);
             const computedHmac = crypto.createHmac('sha256', this.masterKey).update(decryptedJson).digest('hex');
             if (hmac !== computedHmac) throw new Error('Vault tampered!');
-            this.secrets = JSON.parse(decryptedJson);
+            this.data = JSON.parse(decryptedJson);
         }
 
-        // Load SEK
-        const encSek = this.secrets['ENCRYPTED_SEK'];
+        // Update to use SystemKey
+        const encSek = this.data.find(d => 'type' in d.key && d.key.type === 'ENCRYPTED_SEK')?.value;
         if (!encSek) throw new Error('ENCRYPTED_SEK not found');
         const sekHex = Encryption.decrypt(encSek, this.masterKey);
         this.sek = Buffer.from(sekHex, 'hex');
 
         this.locked = false;
-        console.log('Cipher unlocked. SEK loaded in memory.');
+        console.log('Collection unlocked. SEK loaded in memory.');
         this.logOperation('unlock', { timestamp: Date.now() });
     }
 
-    /**
-     * Locks the Cipher, clearing keys from memory.
-     */
-    lock(): void {
-        this.masterKey = null;
-        this.sek = null;
-        this.locked = true;
-        console.log('Cipher locked.');
-        this.logOperation('lock', { timestamp: Date.now() });
-    }
+    // Update method signatures to enforce Partial<T> for user-provided keys
+    insert(key: Partial<T>, value: any, meta: { readonly: boolean } = { readonly: false }, version: number = Date.now()): void {
+        if (this.locked) throw new Error('Collection is locked! Cannot insert.');
+        if (!key || typeof key !== 'object') throw new Error('Key must be a non-empty object');
+        if (!value) throw new Error('Value must be provided');
 
-    /**
-     * Rotates the master key and re-encrypts the vault.
-     * @returns New shares as hex strings.
-     */
-    async rotateMasterKey(): Promise<string[]> {
-        if (this.locked) throw new Error('Cipher is locked! Cannot rotate.');
-        const oldMasterKey = this.masterKey!;
-        this.masterKey = crypto.randomBytes(32);
-        this.shares = await Shamir.split(this.masterKey, this.numShares, this.threshold);
-
-        // Re-encrypt SEK and all secrets with new master key
-        this.secrets['ENCRYPTED_SEK'] = Encryption.encrypt(this.sek!.toString('hex'), this.masterKey);
-        // Note: Individual secrets are encrypted with SEK, so no need to re-encrypt them
-
-        this.saveToFile();
-        this.logOperation('rotateMasterKey', { timestamp: Date.now() });
-        return this.shares.map(s => Buffer.from(s).toString('hex'));
-    }
-
-    /**
-     * Writes a secret to the vault, optionally with a version.
-     * @param key Key for the secret.
-     * @param data Data to encrypt.
-     * @param version Optional version string.
-     */
-    write(key: string, data: string, version: string | null = null): void {
-        if (this.locked) throw new Error('Cipher is locked! Cannot write.');
-        if (typeof key !== 'string' || key.length === 0) throw new Error('Key must be a non-empty string');
-        if (typeof data !== 'string') throw new Error('Data must be a string');
-
-        const enc = Encryption.encrypt(data, this.sek!);
-        const versionKey = version ? `${key}:${version}` : `${key}:${Date.now()}`;
-        this.secrets[versionKey] = enc;
-
-        if (this.persistent) this._scheduleSave();
-        console.log(`Secret written to path: ${versionKey}`);
-        this.logOperation('write', { key: versionKey, timestamp: Date.now() });
-    }
-
-    /**
-     * Reads a secret from the vault, optionally by version.
-     * @param key Key for the secret.
-     * @param version Optional version string; if null, reads latest.
-     * @returns Decrypted data or null if not found.
-     */
-    read(key: string, version: string | null = null): string | null {
-        if (this.locked) throw new Error('Cipher is locked! Cannot read.');
-
-        let versionKey: string;
-        if (version) {
-            versionKey = `${key}:${version}`;
-        } else {
-            // Find latest version
-            const matchingKeys = Object.keys(this.secrets).filter(k => k.startsWith(`${key}:`));
-            if (matchingKeys.length === 0) return null;
-            versionKey = matchingKeys.sort().pop()!;
+        if (this.keySchemaValidator && !this.keySchemaValidator(key)) {
+            throw new Error(`Key validation failed: ${JSON.stringify(this.keySchemaValidator.errors)}`);
+        }
+        if (this.valueSchemaValidator && !this.valueSchemaValidator(value)) {
+            throw new Error(`Value validation failed: ${JSON.stringify(this.valueSchemaValidator.errors)}`);
         }
 
-        const enc = this.secrets[versionKey];
-        if (!enc) return null;
+        const item = {
+            key,
+            value: Encryption.encrypt(JSON.stringify(value), this.sek!),
+            meta,
+            created: Date.now(),
+            deleted: false,
+            version
+        };
+        this.data.push(item);
 
-        const data = Encryption.decrypt(enc, this.sek!);
-        this.logOperation('read', { key: versionKey, timestamp: Date.now() });
-        return data;
+        if (this.persistent) this._scheduleSave();
+        console.log(`Inserted document with key: ${JSON.stringify(key)}, version: ${version}`);
+        this.logOperation('insert', { key: JSON.stringify(key), version, timestamp: Date.now() });
+    }
+
+    find(query: Partial<T> = {}): Array<{ key: Partial<T> | SystemKey; value: any; meta: { readonly: boolean }; created: number; version: number }> {
+        if (this.locked) throw new Error('Collection is locked! Cannot find.');
+        const results = _.where(this.data, { deleted: false, key: query });
+        return results.map((item:any ) => ({
+            key: item.key,
+            value: JSON.parse(Encryption.decrypt(item.value, this.sek!)),
+            meta: item.meta,
+            created: item.created,
+            version: item.version
+        }));
+    }
+
+    findOne(query: Partial<T> = {}): { key: Partial<T> | SystemKey; value: any; meta: { readonly: boolean }; created: number; version: number } | null {
+        if (this.locked) throw new Error('Collection is locked! Cannot findOne.');
+        const item = _.findWhere(this.data, { deleted: false, key: query });
+        if (!item) return null;
+        return {
+            key: item.key,
+            value: JSON.parse(Encryption.decrypt(item.value, this.sek!)),
+            meta: item.meta,
+            created: item.created,
+            version: item.version
+        };
+    }
+
+    update(query: Partial<T>, update: Partial<any>, version?: number): number {
+        if (this.locked) throw new Error('Collection is locked! Cannot update.');
+        if (this.valueSchemaValidator && !this.valueSchemaValidator(update)) {
+            throw new Error(`Update value validation failed: ${JSON.stringify(this.valueSchemaValidator.errors)}`);
+        }
+
+        let count = 0;
+        this.data = this.data.map(item => {
+            if (item.deleted || !_.isMatch(item.key, query)) return item;
+            if (version && item.version !== version) return item;
+            if (item.meta.readonly) return item;
+            count++;
+            return {
+                ...item,
+                value: Encryption.encrypt(JSON.stringify(update), this.sek!),
+                version: version ?? Date.now()
+            };
+        });
+        if (count > 0 && this.persistent) this._scheduleSave();
+        this.logOperation('update', { query: JSON.stringify(query), version, timestamp: Date.now() });
+        return count;
+    }
+
+    delete(query: Partial<T>, version?: number): number {
+        if (this.locked) throw new Error('Collection is locked! Cannot delete.');
+        let count = 0;
+        this.data = this.data.map(item => {
+            if (item.deleted || !_.isMatch(item.key, query)) return item;
+            if (version && item.version !== version) return item;
+            if (item.meta.readonly) return item;
+            count++;
+            return { ...item, deleted: true, value: Encryption.encrypt('{}', this.sek!) };
+        });
+        if (count > 0 && this.persistent) this._scheduleSave();
+        this.logOperation('delete', { query: JSON.stringify(query), version, timestamp: Date.now() });
+        return count;
+    }
+
+    count(query: Partial<T> = {}): number {
+        if (this.locked) throw new Error('Collection is locked! Cannot count.');
+        return this.find(query).length;
+    }
+
+    list(): Array<{ key: Partial<T> | SystemKey; value: any; meta: { readonly: boolean }; type: string; created: number; version: number }> {
+        if (this.locked) throw new Error('Collection is locked! Cannot list.');
+        return this.data
+            .filter(item => !item.deleted && !('type' in item.key && item.key.type === 'ENCRYPTED_SEK'))
+            .map(item => {
+                const decrypted = JSON.parse(Encryption.decrypt(item.value, this.sek!));
+                return {
+                    key: item.key,
+                    value: item.meta.readonly ? 'read-only' : decrypted,
+                    meta: item.meta,
+                    type: typeof decrypted,
+                    created: item.created,
+                    version: item.version
+                };
+            });
+    }
+
+    saveShares(outputDir: string): void {
+        if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
+        this.shares.forEach((share, i) => {
+            const filePath = path.join(outputDir, `share_${i + 1}.txt`);
+            fs.writeFileSync(filePath, Buffer.from(share).toString('hex'), 'utf8');
+        });
+        console.log(`Shares saved securely to ${outputDir}`);
     }
 
     private _scheduleSave(): void {
@@ -293,26 +316,21 @@ class Cipher {
             this._saveTimer = null;
         }
         this.saveToFile();
-        console.log('Secrets flushed to disk immediately.');
+        console.log('Collection flushed to disk immediately.');
     }
 
     saveToFile(): void {
         if (!this.masterKey) throw new Error('Cannot save without master key');
-        const vaultString = JSON.stringify(this.secrets, null, 2);
+        const vaultString = JSON.stringify(this.data, null, 2);
         const encryptedVault = Encryption.encrypt(vaultString, this.masterKey);
         const hmac = crypto.createHmac('sha256', this.masterKey).update(vaultString).digest('hex');
-        const dataToSave = { ...encryptedVault, hmac };
+        const dataToSave = { ...encryptedVault, hmac, passwordHash: this.passwordHash };
         fs.writeFileSync(this.filePath, JSON.stringify(dataToSave), 'utf-8');
         if (process.platform !== 'win32') {
             fs.chmodSync(this.filePath, '600');
         }
     }
 
-    /**
-     * Logs an operation to the audit log.
-     * @param operation Operation name.
-     * @param details Details object.
-     */
     logOperation(operation: string, details: Record<string, any>): void {
         if (!this.auditLogPath) return;
         const timestamp = new Date().toISOString();
@@ -320,95 +338,43 @@ class Cipher {
         fs.appendFileSync(this.auditLogPath, logEntry, 'utf8');
     }
 
-    /**
-     * Backs up the vault to a specified path.
-     * @param backupPath Path to save backup.
-     */
     backup(backupPath: string): void {
         if (!this.persistent || !fs.existsSync(this.filePath)) throw new Error('No vault to backup');
         fs.copyFileSync(this.filePath, backupPath);
-        console.log(`Vault backed up to ${backupPath}`);
+        console.log(`Collection backed up to ${backupPath}`);
         this.logOperation('backup', { path: backupPath, timestamp: Date.now() });
     }
 
-    /**
-     * Restores the vault from a backup.
-     * @param backupPath Path to backup file.
-     */
     restore(backupPath: string): void {
         if (!fs.existsSync(backupPath)) throw new Error('Backup file does not exist');
         this._encryptedVault = JSON.parse(fs.readFileSync(backupPath, 'utf-8'));
-        console.log(`Vault restored from ${backupPath}`);
+        console.log(`Collection restored from ${backupPath}`);
         this.logOperation('restore', { path: backupPath, timestamp: Date.now() });
-    }
-
-    /**
-     * Starts an HTTPS server for remote access (optional).
-     * Requires tlsCertPath and tlsKeyPath in constructor.
-     */
-    startServer(): void {
-        if (!this.tlsCert || !this.tlsKey) throw new Error('TLS cert and key required for server');
-        const app = express();
-        app.use(express.json());
-
-        app.post('/unlock', async (req, res) => {
-            try {
-                await this.unlock(req.body.shares, req.body.password);
-                res.status(200).send('Unlocked');
-            } catch (e: any) {
-                res.status(400).send(e.message);
-            }
-        });
-
-        app.post('/lock', (req, res) => {
-            this.lock();
-            res.status(200).send('Locked');
-        });
-
-        app.post('/write', (req, res) => {
-            try {
-                this.write(req.body.key, req.body.data, req.body.version);
-                res.status(200).send('Written');
-            } catch (e: any) {
-                res.status(400).send(e.message);
-            }
-        });
-
-        app.get('/read', (req, res) => {
-            try {
-                const data = this.read(req.query.key as string, req.query.version as string);
-                res.status(200).json({ data });
-            } catch (e: any) {
-                res.status(400).send(e.message);
-            }
-        });
-
-        // Add more endpoints as needed
-
-        this.server = https.createServer({ cert: this.tlsCert, key: this.tlsKey }, app).listen(this.port, () => {
-            console.log(`Server running on https://localhost:${this.port}`);
-        });
-    }
-
-    stopServer(): void {
-        if (this.server) this.server.close();
     }
 }
 
-// ===== Demo =====
-(async () => {
-    const cipher = new Cipher({ persistent: true, autoSaveInterval: 5000 });
-    if (!cipher['secrets']['ENCRYPTED_SEK']) await cipher.init();
+// shamir-file-unlock.ts (unchanged)
+export class ShamirFileUnlock {
+    static async unlock(filePath: string, shares: string[], password?: string): Promise<Buffer> {
+        if (!fs.existsSync(filePath)) throw new Error('Vault file does not exist');
+        const encryptedVault = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+        const { iv, tag, ciphertext, hmac, passwordHash } = encryptedVault;
 
-    // Example: save shares
-    // cipher.saveShares('./shares');
+        if (shares.length < 3) throw new Error('Need at least 3 shares to unlock');
+        const sharesUint8 = shares.map(s => Uint8Array.from(Buffer.from(s, 'hex')));
+        const masterKey = Buffer.from(await Shamir.combine(sharesUint8));
 
-    await cipher.unlock([/* hex shares */]); // Provide hex shares
+        const decryptedJson = Encryption.decrypt({ iv, tag, ciphertext }, masterKey);
+        const computedHmac = crypto.createHmac('sha256', masterKey).update(decryptedJson).digest('hex');
+        if (hmac !== computedHmac) throw new Error('Vault tampered!');
 
-    cipher.write('secret/foo', 'secret data 1');
-    cipher.write('secret/bar', 'secret data 2');
+        if (password && passwordHash) {
+            const storedHash = crypto.createHash('sha256').update(password).digest('hex');
+            if (passwordHash !== storedHash) {
+                throw new Error('Invalid password');
+            }
+        }
 
-    console.log('Read secret foo:', cipher.read('secret/foo'));
-
-    cipher.lock();
-})();
+        return masterKey;
+    }
+}
