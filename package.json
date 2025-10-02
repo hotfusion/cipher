@@ -13,6 +13,11 @@
   "dependencies": {
     "shamir-secret-sharing" : "^0.0.4",
     "underscore" : "^1.13.7",
-    "ajv" : "^8.17.1"
+    "ajv" : "^8.17.1",
+    "winston" : "^3.18.3",
+    "pkcs11js" : "^2.1.6"
+  },
+  "devDependencies": {
+    "ts-node": "^10.9.2"
   }
 }

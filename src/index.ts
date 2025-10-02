@@ -15,19 +15,17 @@ export interface ICollectionOptions {
     threshold?: number;
     persistent?: boolean;
     filePath?: string;
-    autoSaveInterval?: number;
     password?: string;
+    autoSaveInterval?: number;
     auditLogPath?: string;
     port?: number;
     tlsCertPath?: string;
     tlsKeyPath?: string;
 }
 
-// Define a type for system keys (e.g., ENCRYPTED_SEK)
 type SystemKey = { type: string };
 
 export class Collection<T extends object = any> {
-    // Update data to allow key to be Partial<T> or SystemKey
     private data: Array<{
         key: Partial<T> | SystemKey;
         value: EncryptedData;
@@ -66,12 +64,12 @@ export class Collection<T extends object = any> {
         private schema: { key?: object; value?: object },
         options: ICollectionOptions = {}
     ) {
-        // ... (constructor logic unchanged)
         this.numShares = options.numShares ?? 5;
         this.threshold = options.threshold ?? 3;
         this.persistent = options.persistent ?? false;
         this.autoSaveInterval = options.autoSaveInterval ?? 1000;
         this.port = options.port ?? 3000;
+
         if (options.tlsCertPath) this.tlsCert = fs.readFileSync(options.tlsCertPath, 'utf8');
         if (options.tlsKeyPath) this.tlsKey = fs.readFileSync(options.tlsKeyPath, 'utf8');
 
@@ -129,13 +127,21 @@ export class Collection<T extends object = any> {
     }
 
     async init(): Promise<string[]> {
-        this.masterKey = crypto.randomBytes(32);
-        this.sek = crypto.randomBytes(32);
-        this.shares = await Shamir.split(new Uint8Array(this.masterKey), this.numShares, this.threshold);
-        // Use SystemKey type for ENCRYPTED_SEK
+        const masterKey = crypto.randomBytes(32);
+        const sek = crypto.randomBytes(32);
+        if (!masterKey || !sek) throw new Error('Failed to generate keys');
+        this.masterKey = masterKey;
+        this.sek = sek;
+        console.log('Initialized masterKey and sek:', {
+            masterKeyLength: this.masterKey.length,
+            sekLength: this.sek.length
+        });
+
+        this.shares = await Shamir.split(new Uint8Array(masterKey), this.numShares, this.threshold);
+        const encryptedSek = Encryption.encrypt(sek.toString('hex'), masterKey);
         this.data.push({
             key: { type: 'ENCRYPTED_SEK' } as SystemKey,
-            value: Encryption.encrypt(this.sek.toString('hex'), this.masterKey),
+            value: encryptedSek,
             meta: { readonly: true },
             created: Date.now(),
             deleted: false,
@@ -158,32 +164,74 @@ export class Collection<T extends object = any> {
         }
 
         const sharesUint8 = providedShares.map(s => Uint8Array.from(Buffer.from(s, 'hex')));
-        this.masterKey = Buffer.from(await Shamir.combine(sharesUint8));
+        const masterKey = Buffer.from(await Shamir.combine(sharesUint8));
+        if (!masterKey) throw new Error('Failed to reconstruct master key');
+        this.masterKey = masterKey;
 
         if (this._encryptedVault) {
             const { iv, tag, ciphertext, hmac } = this._encryptedVault;
-            const decryptedJson = Encryption.decrypt({ iv, tag, ciphertext }, this.masterKey);
-            const computedHmac = crypto.createHmac('sha256', this.masterKey).update(decryptedJson).digest('hex');
+            const decryptedJson = Encryption.decrypt({ iv, tag, ciphertext }, masterKey);
+            const computedHmac = crypto.createHmac('sha256', masterKey).update(decryptedJson).digest('hex');
             if (hmac !== computedHmac) throw new Error('Vault tampered!');
             this.data = JSON.parse(decryptedJson);
         }
 
-        // Update to use SystemKey
         const encSek = this.data.find(d => 'type' in d.key && d.key.type === 'ENCRYPTED_SEK')?.value;
         if (!encSek) throw new Error('ENCRYPTED_SEK not found');
-        const sekHex = Encryption.decrypt(encSek, this.masterKey);
-        this.sek = Buffer.from(sekHex, 'hex');
+        const sekHex = Encryption.decrypt(encSek, masterKey);
+        const sek = Buffer.from(sekHex, 'hex');
+        if (!sek) throw new Error('Failed to load SEK');
+        this.sek = sek;
+        console.log('Unlocked with masterKey and sek:', {
+            masterKeyLength: masterKey.length,
+            sekLength: sek.length
+        });
 
         this.locked = false;
         console.log('Collection unlocked. SEK loaded in memory.');
         this.logOperation('unlock', { timestamp: Date.now() });
     }
 
-    // Update method signatures to enforce Partial<T> for user-provided keys
+    lock(): void {
+        this.masterKey = null;
+        this.sek = null;
+        this.locked = true;
+        console.log('Collection locked.');
+        this.logOperation('lock', { timestamp: Date.now() });
+    }
+
+    async rotateMasterKey(): Promise<string[]> {
+        if (this.locked) throw new Error('Collection is locked! Cannot rotate.');
+        if (!this.masterKey || !this.sek) throw new Error('Master key or SEK not available');
+        const oldMasterKey: Buffer = this.masterKey;
+        const sek: Buffer = this.sek;
+        const newMasterKey = crypto.randomBytes(32);
+        if (!newMasterKey) throw new Error('Failed to generate new master key');
+        this.masterKey = newMasterKey;
+
+        this.shares = await Shamir.split(new Uint8Array(newMasterKey), this.numShares, this.threshold);
+        this.data = this.data.map(item => {
+            if ('type' in item.key && item.key.type === 'ENCRYPTED_SEK') {
+                const decryptedSek = Encryption.decrypt(item.value, oldMasterKey);
+                return {
+                    ...item,
+                    value: Encryption.encrypt(decryptedSek, newMasterKey)
+                };
+            }
+            return item;
+        });
+
+        this.saveToFile();
+        this.logOperation('rotateMasterKey', { timestamp: Date.now() });
+        return this.shares.map(s => Buffer.from(s).toString('hex'));
+    }
+
     insert(key: Partial<T>, value: any, meta: { readonly: boolean } = { readonly: false }, version: number = Date.now()): void {
         if (this.locked) throw new Error('Collection is locked! Cannot insert.');
         if (!key || typeof key !== 'object') throw new Error('Key must be a non-empty object');
         if (!value) throw new Error('Value must be provided');
+        if (!this.sek) throw new Error('SEK not available');
+        const sek: Buffer = this.sek;
 
         if (this.keySchemaValidator && !this.keySchemaValidator(key)) {
             throw new Error(`Key validation failed: ${JSON.stringify(this.keySchemaValidator.errors)}`);
@@ -194,7 +242,7 @@ export class Collection<T extends object = any> {
 
         const item = {
             key,
-            value: Encryption.encrypt(JSON.stringify(value), this.sek!),
+            value: Encryption.encrypt(JSON.stringify(value), sek),
             meta,
             created: Date.now(),
             deleted: false,
@@ -209,10 +257,13 @@ export class Collection<T extends object = any> {
 
     find(query: Partial<T> = {}): Array<{ key: Partial<T> | SystemKey; value: any; meta: { readonly: boolean }; created: number; version: number }> {
         if (this.locked) throw new Error('Collection is locked! Cannot find.');
+        if (!this.sek) throw new Error('SEK not available');
+        const sek: Buffer = this.sek;
+
         const results = _.where(this.data, { deleted: false, key: query });
-        return results.map((item:any ) => ({
+        return results.map((item:any) => ({
             key: item.key,
-            value: JSON.parse(Encryption.decrypt(item.value, this.sek!)),
+            value: JSON.parse(Encryption.decrypt(item.value, sek)),
             meta: item.meta,
             created: item.created,
             version: item.version
@@ -221,11 +272,14 @@ export class Collection<T extends object = any> {
 
     findOne(query: Partial<T> = {}): { key: Partial<T> | SystemKey; value: any; meta: { readonly: boolean }; created: number; version: number } | null {
         if (this.locked) throw new Error('Collection is locked! Cannot findOne.');
+        if (!this.sek) throw new Error('SEK not available');
+        const sek: Buffer = this.sek;
+
         const item = _.findWhere(this.data, { deleted: false, key: query });
         if (!item) return null;
         return {
             key: item.key,
-            value: JSON.parse(Encryption.decrypt(item.value, this.sek!)),
+            value: JSON.parse(Encryption.decrypt(item.value, sek)),
             meta: item.meta,
             created: item.created,
             version: item.version
@@ -234,6 +288,9 @@ export class Collection<T extends object = any> {
 
     update(query: Partial<T>, update: Partial<any>, version?: number): number {
         if (this.locked) throw new Error('Collection is locked! Cannot update.');
+        if (!this.sek) throw new Error('SEK not available');
+        const sek: Buffer = this.sek;
+
         if (this.valueSchemaValidator && !this.valueSchemaValidator(update)) {
             throw new Error(`Update value validation failed: ${JSON.stringify(this.valueSchemaValidator.errors)}`);
         }
@@ -246,7 +303,7 @@ export class Collection<T extends object = any> {
             count++;
             return {
                 ...item,
-                value: Encryption.encrypt(JSON.stringify(update), this.sek!),
+                value: Encryption.encrypt(JSON.stringify(update), sek),
                 version: version ?? Date.now()
             };
         });
@@ -257,13 +314,16 @@ export class Collection<T extends object = any> {
 
     delete(query: Partial<T>, version?: number): number {
         if (this.locked) throw new Error('Collection is locked! Cannot delete.');
+        if (!this.sek) throw new Error('SEK not available');
+        const sek: Buffer = this.sek;
+
         let count = 0;
         this.data = this.data.map(item => {
             if (item.deleted || !_.isMatch(item.key, query)) return item;
             if (version && item.version !== version) return item;
             if (item.meta.readonly) return item;
             count++;
-            return { ...item, deleted: true, value: Encryption.encrypt('{}', this.sek!) };
+            return { ...item, deleted: true, value: Encryption.encrypt('{}', sek) };
         });
         if (count > 0 && this.persistent) this._scheduleSave();
         this.logOperation('delete', { query: JSON.stringify(query), version, timestamp: Date.now() });
@@ -277,10 +337,13 @@ export class Collection<T extends object = any> {
 
     list(): Array<{ key: Partial<T> | SystemKey; value: any; meta: { readonly: boolean }; type: string; created: number; version: number }> {
         if (this.locked) throw new Error('Collection is locked! Cannot list.');
+        if (!this.sek) throw new Error('SEK not available');
+        const sek: Buffer = this.sek;
+
         return this.data
             .filter(item => !item.deleted && !('type' in item.key && item.key.type === 'ENCRYPTED_SEK'))
             .map(item => {
-                const decrypted = JSON.parse(Encryption.decrypt(item.value, this.sek!));
+                const decrypted = JSON.parse(Encryption.decrypt(item.value, sek));
                 return {
                     key: item.key,
                     value: item.meta.readonly ? 'read-only' : decrypted,
@@ -321,9 +384,10 @@ export class Collection<T extends object = any> {
 
     saveToFile(): void {
         if (!this.masterKey) throw new Error('Cannot save without master key');
+        const masterKey: Buffer = this.masterKey;
         const vaultString = JSON.stringify(this.data, null, 2);
-        const encryptedVault = Encryption.encrypt(vaultString, this.masterKey);
-        const hmac = crypto.createHmac('sha256', this.masterKey).update(vaultString).digest('hex');
+        const encryptedVault = Encryption.encrypt(vaultString, masterKey);
+        const hmac = crypto.createHmac('sha256', masterKey).update(vaultString).digest('hex');
         const dataToSave = { ...encryptedVault, hmac, passwordHash: this.passwordHash };
         fs.writeFileSync(this.filePath, JSON.stringify(dataToSave), 'utf-8');
         if (process.platform !== 'win32') {
@@ -352,29 +416,4 @@ export class Collection<T extends object = any> {
         this.logOperation('restore', { path: backupPath, timestamp: Date.now() });
     }
 }
-
-// shamir-file-unlock.ts (unchanged)
-export class ShamirFileUnlock {
-    static async unlock(filePath: string, shares: string[], password?: string): Promise<Buffer> {
-        if (!fs.existsSync(filePath)) throw new Error('Vault file does not exist');
-        const encryptedVault = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-        const { iv, tag, ciphertext, hmac, passwordHash } = encryptedVault;
-
-        if (shares.length < 3) throw new Error('Need at least 3 shares to unlock');
-        const sharesUint8 = shares.map(s => Uint8Array.from(Buffer.from(s, 'hex')));
-        const masterKey = Buffer.from(await Shamir.combine(sharesUint8));
-
-        const decryptedJson = Encryption.decrypt({ iv, tag, ciphertext }, masterKey);
-        const computedHmac = crypto.createHmac('sha256', masterKey).update(decryptedJson).digest('hex');
-        if (hmac !== computedHmac) throw new Error('Vault tampered!');
-
-        if (password && passwordHash) {
-            const storedHash = crypto.createHash('sha256').update(password).digest('hex');
-            if (passwordHash !== storedHash) {
-                throw new Error('Invalid password');
-            }
-        }
-
-        return masterKey;
-    }
-}
+``
