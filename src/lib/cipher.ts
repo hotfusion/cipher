@@ -1,433 +1,251 @@
-/*
-import { EncryptedFolder } from './luks';
-import pkcs11 from 'pkcs11js';
-import crypto from 'crypto';
 import fs from 'fs';
-import path from 'path';
-import winston from 'winston';
+import crypto from 'crypto';
 //@ts-ignore
-import * as Loki from 'lokijs'
-interface DBRecord {
-    key: Record<string, any>;
-    _encrypted: Record<string, Buffer>;
-    _timestamp: number;
+import Loki from 'lokijs';
+import Ajv from 'ajv';
+
+// Custom type definitions for LokiJS 1.5.12
+interface LokiCollection {
+    name: string;
+    insert(doc: any): any;
+    find(query?: any): any[];
+    findAndRemove(query?: any): void;
+    get(id: number): any;
+    chain(): { find(query?: any): { simplesort(prop: string, isDesc?: boolean): { data(): any[] } } };
 }
 
-interface IHSM {
-    containerPath: string;
-    mountPath: string;
+interface Loki {
+    getCollection(name: string): LokiCollection | null;
+    addCollection(name: string, options?: any): LokiCollection;
+    saveDatabase(callback: (err?: any) => void): void;
+}
+
+// Override LokiJS module declaration
+
+
+interface ICipher {
+    readonly: boolean;
+    locked: boolean;
+    path: string;
     password: string;
-    pin: string;
-    hsmSlot?: number;
-    maxMemoryMB?: number;
-    logLevel?: string;
+    size: number;
 }
 
-export class HSM {
-    private readonly encryptedFolder: EncryptedFolder;
-    private readonly session: Buffer;
-    private readonly keyHandle: Buffer;
-    private readonly dbPath: string;
-    private readonly snapshotPath: string;
-    private readonly maxMemoryBytes: number;
-    private pkcs11Lib: pkcs11.PKCS11;
-    private store: Map<string, DBRecord> = new Map();
-    private logger: winston.Logger;
+interface ICollection {
+    name: 'users';
+    schema: any;
+}
 
-    constructor(options: IHSM) {
-        if (!options.pin) {
-            throw new Error('HSM PIN is required. You must provide hsmPin in options.');
-        }
+const algorithm = 'aes-256-gcm';
+const keyLen = 32;
+const ivLen = 12;
+const saltLen = 16;
+const tagLen = 16;
 
-        if(!fs.existsSync(options.containerPath))
-            fs.mkdirSync(path.dirname(options.containerPath),{recursive:true});
+class EncryptedFsAdapter {
+    private readonly password: string;
 
-        // Initialize logger
-        this.logger = winston.createLogger({
-            level: options.logLevel || 'info',
-            format: winston.format.combine(
-                winston.format.timestamp(),
-                winston.format.printf(({ timestamp, level, message }) => {
-                    return `${timestamp} [${level.toUpperCase()}]: ${message}`;
-                })
-            ),
-            transports: [new winston.transports.Console()]
-        });
-
-        // Setup encrypted folder
-        this.encryptedFolder = new EncryptedFolder({
-            containerPath: options.containerPath,
-            mountPath: options.mountPath,
-            password: options.password,
-            logLevel: options.logLevel
-        });
-
-        this.dbPath = path.join(options.mountPath, 'memdb');
-        this.snapshotPath = path.join(this.dbPath, 'snapshot.json');
-        this.maxMemoryBytes = (options.maxMemoryMB || 2048) * 1024 * 1024;
-
-        this.ensureSoftHSM2Config();
-        this.ensureSoftHSM2Installed();
-
-        // Initialize token if it doesn't exist, using the PIN provided
-        this.ensureTokenInitialized(options.pin, options.hsmSlot || 0);
-
-        // Load SoftHSM2 library
-        this.pkcs11Lib = new pkcs11.PKCS11();
-        try {
-            this.pkcs11Lib.load('/usr/lib/softhsm/libsofthsm2.so');
-            this.logger.info('SoftHSM2 library loaded');
-        } catch (error) {
-            this.logger.error('Failed to load SoftHSM2 library');
-            throw error;
-        }
-
-        this.pkcs11Lib.C_Initialize();
-
-        // Get slot and open session
-        const slots = this.pkcs11Lib.C_GetSlotList(true);
-        if (!slots.length) throw new Error('No slots with tokens found');
-
-        const slotHandle = slots[options.hsmSlot || 0];
-        if (!slotHandle) throw new Error(`Slot index ${options.hsmSlot} invalid`);
-
-        this.session = this.pkcs11Lib.C_OpenSession(
-            slotHandle,
-            pkcs11.CKF_SERIAL_SESSION | pkcs11.CKF_RW_SESSION
-        );
-
-        try {
-            this.pkcs11Lib.C_Login(this.session, pkcs11.CKU_USER, options.pin);
-        } catch {
-            throw new Error('HSM login failed. Check your hsmPin.');
-        }
-
-        this.logger.info('Logged into SoftHSM2');
-        this.keyHandle = this.findOrCreateKey();
+    constructor(password: string) {
+        this.password = password;
     }
-    /!**
-     * Ensure SoftHSM2 configuration exists, create if missing
-     *!/
-    private ensureSoftHSM2Config(): void {
-        const { execSync } = require('child_process');
-        const os = require('os');
-        const fs = require('fs');
-        const path = require('path');
 
-        const homeDir = os.homedir();
-        const configDir = path.join(homeDir, '.softhsm');
-        const configPath = path.join(configDir, 'softhsm2.conf');
-        const tokenDir = path.join(configDir, 'tokens');
-
-        // Create config directory if missing
-        if (!fs.existsSync(configDir)) {
-            fs.mkdirSync(configDir, { recursive: true });
-            this.logger.info(`Created SoftHSM2 config directory: ${configDir}`);
-        }
-
-        // Create token directory if missing
-        if (!fs.existsSync(tokenDir)) {
-            fs.mkdirSync(tokenDir, { recursive: true });
-            this.logger.info(`Created SoftHSM2 token directory: ${tokenDir}`);
-        }
-
-        // Create config file if missing
-        if (!fs.existsSync(configPath)) {
-            const configContent = [
-                `directories.tokendir = ${tokenDir}`,
-                `objectstore.backend = file`,
-                `log.level = INFO`
-            ].join('\n');
-            fs.writeFileSync(configPath, configContent);
-            this.logger.info(`Created SoftHSM2 config file: ${configPath}`);
-        }
-
-        // Set environment variable so SoftHSM2 finds it
-        process.env.SOFTHSM2_CONF = configPath;
-        this.logger.debug(`SOFTHSM2_CONF set to ${configPath}`);
+    private deriveKey(salt: Buffer): Buffer {
+        return crypto.pbkdf2Sync(this.password, salt, 100000, keyLen, 'sha256');
     }
-    /!**
-     * Check if SoftHSM2 is installed, install if not
-     *!/
-    private ensureSoftHSM2Installed(): void {
-        const { execSync } = require('child_process');
 
-        try {
-            // Check if softhsm2 is installed
-            execSync('which softhsm2-util', { stdio: 'ignore' });
-            this.logger.debug('SoftHSM2 already installed');
-        } catch {
-            this.logger.warn('SoftHSM2 not found. Installing...');
+    loadDatabase(dbname: string, callback: (err: any, data?: string) => void): void {
+        fs.readFile(dbname, (err, data) => {
+            if (err) {
+                if (err.code === 'ENOENT') {
+                    return callback(null, '{}');
+                }
+                return callback(err);
+            }
             try {
-                execSync('sudo apt-get update && sudo apt-get install -y softhsm2', {
-                    stdio: 'inherit'
-                });
-                this.logger.info('SoftHSM2 installed successfully');
-            } catch (error) {
-                this.logger.error('Failed to install SoftHSM2', { error });
-                throw new Error('SoftHSM2 installation failed. Please install manually: sudo apt-get install softhsm2');
+                const salt = data.slice(0, saltLen);
+                const iv = data.slice(saltLen, saltLen + ivLen);
+                const tag = data.slice(saltLen + ivLen, saltLen + ivLen + tagLen);
+                const encrypted = data.slice(saltLen + ivLen + tagLen);
+                const key = this.deriveKey(salt);
+                const decipher = crypto.createDecipheriv(algorithm, key, iv);
+                decipher.setAuthTag(tag);
+                let decrypted = decipher.update(encrypted, undefined, 'utf8');
+                decrypted += decipher.final('utf8');
+                callback(null, decrypted);
+            } catch (e) {
+                callback(e);
             }
-        }
+        });
     }
 
-    /!**
-     * Check if token is initialized, initialize if not
-     *!/
-    private ensureTokenInitialized(pin: string,slot:number): void {
-        const { execSync } = require('child_process');
-        const crypto = require('crypto');
-
+    saveDatabase(dbname: string, dbstring: string, callback: (err?: any) => void): void {
         try {
-            // List all slots
-            const output = execSync('softhsm2-util --show-slots', { encoding: 'utf8' });
-            const lines: any[] = output.split('\n');
-
-            // Check if any token already exists
-            const tokenLine: any = lines.find((line: any) => line.includes('Token Label'));
-            if (tokenLine) {
-                const match = tokenLine.match(/Slot (\d+)/);
-                const slot = match ? parseInt(match[1], 10) : null;
-                if (slot !== null) {
-                    this.logger.debug(`Token already initialized in slot ${slot}`);
-                    return; // Token exists, done
-                }
-            }
-
-            // No token yet: initialize in first free slot
-            const soPin = crypto.randomBytes(16).toString('hex');
-            execSync(
-                `softhsm2-util --init-token --free --label "MemDB-Token" --pin ${pin} --so-pin ${soPin}`,
-                { stdio: 'inherit' }
-            );
-
-            this.logger.info(`Token initialized successfully (slot chosen automatically)`);
-        } catch (err: any) {
-            this.logger.error('Failed to initialize token', { error: err });
-            throw new Error('Token initialization failed');
+            const salt = crypto.randomBytes(saltLen);
+            const iv = crypto.randomBytes(ivLen);
+            const key = this.deriveKey(salt);
+            const cipher = crypto.createCipheriv(algorithm, key, iv);
+            let encrypted = cipher.update(dbstring, 'utf8');
+            encrypted = Buffer.concat([encrypted, cipher.final()]);
+            const tag = cipher.getAuthTag();
+            const data = Buffer.concat([salt, iv, tag, encrypted]);
+            fs.writeFile(dbname, data, callback);
+        } catch (e) {
+            callback(e);
         }
-    }
-
-
-    /!**
-     * Find existing key or create new one in HSM
-     *!/
-    private findOrCreateKey(): Buffer {
-        // Try to find existing key
-        const template = [
-            { type: pkcs11.CKA_CLASS, value: pkcs11.CKO_SECRET_KEY },
-            { type: pkcs11.CKA_KEY_TYPE, value: pkcs11.CKK_AES },
-            { type: pkcs11.CKA_LABEL, value: 'memdb-key' }
-        ];
-
-        this.pkcs11Lib.C_FindObjectsInit(this.session, template);
-        const handles = this.pkcs11Lib.C_FindObjects(this.session, 1);
-        this.pkcs11Lib.C_FindObjectsFinal(this.session);
-
-        if (handles.length > 0) {
-            this.logger.info('Found existing HSM key');
-            return handles[0];
-        }
-
-        // Create new key
-        this.logger.info('Creating new HSM key');
-        const keyTemplate = [
-            { type: pkcs11.CKA_CLASS, value: pkcs11.CKO_SECRET_KEY },
-            { type: pkcs11.CKA_KEY_TYPE, value: pkcs11.CKK_AES },
-            { type: pkcs11.CKA_LABEL, value: 'memdb-key' },
-            { type: pkcs11.CKA_VALUE_LEN, value: 32 }, // 256-bit key
-            { type: pkcs11.CKA_TOKEN, value: true },
-            { type: pkcs11.CKA_ENCRYPT, value: true },
-            { type: pkcs11.CKA_DECRYPT, value: true },
-            { type: pkcs11.CKA_PRIVATE, value: true },
-            { type: pkcs11.CKA_SENSITIVE, value: true },
-            { type: pkcs11.CKA_EXTRACTABLE, value: false } // Key cannot be extracted
-        ];
-
-        return this.pkcs11Lib.C_GenerateKey(
-            this.session,
-            { mechanism: pkcs11.CKM_AES_KEY_GEN },
-            keyTemplate
-        );
-    }
-
-    /!**
-     * Initialize database
-     *!/
-    async initialize(containerSizeMB: number = 512): Promise<void> {
-        this.logger.info('Initializing database...');
-
-        try {
-            // Create container if doesn't exist
-            if (!fs.existsSync(this.encryptedFolder['containerPath'])) {
-                this.logger.info('Creating new encrypted container...');
-                this.encryptedFolder.createContainer(containerSizeMB);
-
-                if (!fs.existsSync(this.dbPath)) {
-                    fs.mkdirSync(this.dbPath, { recursive: true });
-                }
-
-                this.encryptedFolder.close();
-            }
-
-            this.logger.info(`Database loaded: ${this.store.size} records in memory`);
-        } catch (error) {
-            this.logger.error('Initialization failed', { error });
-            throw error;
-        }
-    }
-
-    /!**
-     * Encrypt data using SoftHSM2
-     *!/
-    private encrypt(plaintext: string): Buffer {
-        const plaintextBuffer = Buffer.from(plaintext, 'utf8');
-
-        // Generate random IV
-        const iv = crypto.randomBytes(16);
-
-        // Initialize encryption
-        this.pkcs11Lib.C_EncryptInit(
-            this.session,
-            { mechanism: pkcs11.CKM_AES_CBC_PAD, parameter: iv },
-            this.keyHandle
-        );
-
-        // Encrypt data
-        const encrypted = this.pkcs11Lib.C_Encrypt(
-            this.session,
-            plaintextBuffer,
-            Buffer.alloc(plaintextBuffer.length + 32) // Extra space for padding
-        );
-
-        // Combine IV + encrypted data
-        return Buffer.concat([iv, encrypted]);
-    }
-
-    /!**
-     * Decrypt data using SoftHSM2
-     *!/
-    private decrypt(ciphertext: Buffer): string {
-        // Extract IV and encrypted data
-        const iv = ciphertext.subarray(0, 16);
-        const encrypted = ciphertext.subarray(16);
-
-        // Initialize decryption
-        this.pkcs11Lib.C_DecryptInit(
-            this.session,
-            { mechanism: pkcs11.CKM_AES_CBC_PAD, parameter: iv },
-            this.keyHandle
-        );
-
-        // Decrypt data
-        const decrypted = this.pkcs11Lib.C_Decrypt(
-            this.session,
-            encrypted,
-            Buffer.alloc(encrypted.length + 32)
-        );
-
-        return decrypted.toString('utf8');
-    }
-
-    /!**
-     * Hash key object
-     *!/
-    private hashKey(key: Record<string, any>): string {
-        const keyString = JSON.stringify(key, Object.keys(key).sort());
-        return crypto.createHash('sha256').update(keyString).digest('hex');
-    }
-
-    /!**
-     * Get stats
-     *!/
-    getStats(): {
-        recordCount: number;
-        estimatedMemoryMB: number;
-        maxMemoryMB: number;
-    } {
-        const estimatedBytes = JSON.stringify(Array.from(this.store.values())).length;
-
-        return {
-            recordCount: this.store.size,
-            estimatedMemoryMB: Math.round(estimatedBytes / (1024 * 1024) * 100) / 100,
-            maxMemoryMB: this.maxMemoryBytes / (1024 * 1024)
-        };
-    }
-
-    private checkMemoryUsage(): void {
-        const stats = this.getStats();
-        const usagePercent = (stats.estimatedMemoryMB / stats.maxMemoryMB) * 100;
-
-        if (usagePercent > 90) {
-            this.logger.warn(`Memory usage high: ${usagePercent.toFixed(1)}%`);
-        }
-    }
-
-    /!**
-     * Shutdown
-     *!/
-    async shutdown(): Promise<void> {
-        this.logger.info('Shutting down database...');
-        // Logout and close HSM session
-        this.pkcs11Lib.C_Logout(this.session);
-        this.pkcs11Lib.C_CloseSession(this.session);
-        this.pkcs11Lib.C_Finalize();
-        this.logger.info('Database shutdown complete');
     }
 }
 
-import {execSync} from "child_process";
+class CipherCollection {
+    private cipher: Cipher;
+    private collection: LokiCollection;
+    private ajv: Ajv;
+    private schema: any;
 
-(async () => {
-    const hsm = new HSM({
-        containerPath : path.resolve(__dirname,'./_.store/cipher.img'),
-        mountPath     : path.resolve(__dirname,'./secret-folder'),
-        password      : 'disk-password12',
-        pin           : '1234',
-        hsmSlot       : 0,
-        maxMemoryMB   : 2048,
-        logLevel      : 'debug'
-    });
-
-    // Initialize
-    await hsm.initialize(512);
-
-
-    const check = execSync(`mount | grep ${path.resolve(__dirname,'./secret-folder/database.db')} || true`).toString();
-    if (!check.includes(path.resolve(__dirname,'./secret-folder/database.db'))) {
-        throw new Error('Encrypted folder is NOT mounted — Loki will leak secrets!');
+    constructor(cipher: Cipher, collection: LokiCollection, schema: any) {
+        this.cipher = cipher;
+        this.collection = collection;
+        this.ajv = new Ajv({ allErrors: true });
+        this.schema = schema;
     }
 
-// create database instance (in-memory, but can be saved later)
-    const db = new Loki.default(path.resolve(__dirname,'./secret-folder/database.db'), {
-        autoload: true,               // load if exists
-        autoloadCallback: databaseInitialize,
-        autosave: true,               // auto save
-        autosaveInterval: 4000        // every 4s
-    });
-
-    function databaseInitialize() {
-        let users = db.getCollection('users');
-
-        if (users === null) {
-            users = db.addCollection('users'); // create if not exists
+    private validateSchema(data: any): void {
+        if (this.schema && Object.keys(this.schema).length > 0) {
+            const validate = this.ajv.compile(this.schema);
+            if (!validate(data)) {
+                throw new Error(`Schema validation failed: ${JSON.stringify(validate.errors)}`);
+            }
         }
-
-        // Insert some data
-        users.insert({ name: 'Alice', age: 30 });
-        users.insert({ name: 'Bob', age: 25 });
-        users.insert({ name: 'Charlie', age: 35 });
-
-        // Query data
-        const result = users.find({ age: { '$gt': 26 } });
-        console.log('Users over 26:', result);
-
-        // Save database explicitly (optional if autosave is on)
-        //db.saveDatabase();
     }
 
-    // Save and shutdown
-    //await db.saveToDisk();
-    //await db.shutdown();
-})()
+    async insert(key: { name: string }, secret: any, meta: { readonly?: boolean; version?: number } = {}): Promise<number> {
+        if (!this.cipher.canWrite(meta)) {
+            throw new Error('Cannot insert: readonly mode');
+        }
+        const name = key.name;
+        const existing = this.collection.find({ name });
+        if (existing.length > 0) {
+            throw new Error('Key already exists; use update instead');
+        }
+        const version = meta.version || 1;
+        if (version < 1) {
+            throw new Error('Version must be at least 1');
+        }
+        const doc = { name, secret, version };
+        this.validateSchema(doc);
+        const inserted = this.collection.insert(doc);
+        await this.cipher.save();
+        return inserted.$loki;
+    }
 
-*/
+    async update(key: { name: string }, secret: any, meta: { readonly?: boolean; version?: number } = {}): Promise<number> {
+        if (!this.cipher.canWrite(meta)) {
+            throw new Error('Cannot update: readonly mode');
+        }
+        const name = key.name;
+        const existing = this.collection.chain().find({ name }).simplesort('version', true).data();
+        if (existing.length === 0) {
+            throw new Error('Key does not exist; use insert instead');
+        }
+        const maxVersion = existing[existing.length - 1].version;
+        const version = meta.version || maxVersion + 1;
+        if (version <= maxVersion) {
+            throw new Error('Version must be higher than previous');
+        }
+        const doc = { name, secret, version };
+        this.validateSchema(doc);
+        const inserted = this.collection.insert(doc);
+        await this.cipher.save();
+        return inserted.$loki;
+    }
+
+    async delete(key: { name: string }, meta: { readonly?: boolean; version?: number } = {}): Promise<void> {
+        if (!this.cipher.canWrite(meta)) {
+            throw new Error('Cannot delete: readonly mode');
+        }
+        const name = key.name;
+        const query: any = { name };
+        if (meta.hasOwnProperty('version')) {
+            query.version = meta.version;
+        }
+        this.collection.findAndRemove(query);
+        await this.cipher.save();
+    }
+
+    find(key: { name: string }): { _id: number; name: string } | null {
+        const name = key.name;
+        const existing = this.collection.chain().find({ name }).simplesort('version', true).data();
+        if (existing.length === 0) {
+            return null;
+        }
+        const latest = existing[existing.length - 1];
+        return { _id: latest.$loki, name: latest.name };
+    }
+
+    unseal(_id: number): any {
+        const doc = this.collection.get(_id);
+        if (!doc) {
+            throw new Error('Document not found');
+        }
+        return doc.secret;
+    }
+}
+
+class Cipher implements Loki {
+    private settings: ICipher;
+    private collections: Map<string, { collection: LokiCollection; schema: any }>;
+    // Explicitly declare Loki methods
+    getCollection: (name: string) => LokiCollection | null;
+    addCollection: (name: string, options?: any) => LokiCollection;
+    saveDatabase: (callback: (err?: any) => void) => void;
+
+    constructor(settings: ICipher, collections: ICollection[] = [{ name: 'users', schema: {} }]) {
+        const adapter = new EncryptedFsAdapter(settings.password);
+        // Call Loki constructor
+        const lokiInstance = new Loki(`${settings.path}/database.db`, {
+            adapter,
+            autoload: true,
+            autoloadCallback: () => this.databaseInitialize(collections),
+            autosave: false,
+        });
+        // Assign Loki methods to this instance
+        this.getCollection = lokiInstance.getCollection.bind(lokiInstance);
+        this.addCollection = lokiInstance.addCollection.bind(lokiInstance);
+        this.saveDatabase = lokiInstance.saveDatabase.bind(lokiInstance);
+        this.settings = settings;
+        this.collections = new Map();
+    }
+
+    private databaseInitialize(collections: ICollection[]): void {
+        for (const col of collections) {
+            let collection = this.getCollection(col.name);
+            if (collection === null) {
+                collection = this.addCollection(col.name, {
+                    indices: ['name', 'version'],
+                });
+            }
+            this.collections.set(col.name, { collection, schema: col.schema });
+        }
+    }
+
+    canWrite(meta: any): boolean {
+        const readonlyOverride = meta.hasOwnProperty('readonly') ? meta.readonly : this.settings.readonly;
+        return !readonlyOverride;
+    }
+
+    async save(): Promise<void> {
+        return new Promise((resolve, reject) => {
+            this.saveDatabase((err) => {
+                if (err) reject(err);
+                else resolve();
+            });
+        });
+    }
+
+    collection(name: string): CipherCollection {
+        const col = this.collections.get(name);
+        if (!col) {
+            throw new Error(`Collection ${name} not found`);
+        }
+        return new CipherCollection(this, col.collection, col.schema);
+    }
+}

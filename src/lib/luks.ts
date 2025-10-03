@@ -12,9 +12,6 @@ interface IContainer {
 type ILuks              = Omit<IContainer, 'directory'>;
 type IContainerSettings = Pick<IContainer, 'locked'>;
 
-//
-
-
 class Container {
     imagepath !: string
     id : string = '_.cipher.img'
@@ -24,7 +21,13 @@ class Container {
 
     }
     getSettings():IContainerSettings {
-        return JSON.parse(fs.readFileSync(join(this.config.directory, "_.settings.json")).toString())
+        try{
+            return JSON.parse(fs.readFileSync(join(this.config.directory, "_.settings.json")).toString())
+        }catch(e){
+            return  {
+                locked: false,
+            }
+        }
     }
     mount(){
         this.unmount();
@@ -34,19 +37,57 @@ class Container {
         if(!fs.existsSync(dirname(this.imagepath)))
             fs.mkdirSync(dirname(this.imagepath),{recursive:true});
 
-        if(!fs.existsSync(this.imagepath)) {
-            execSync(`dd if=/dev/zero of=${this.imagepath} bs=1M count=${this.config.size}`);
-            execSync(`echo -n "${this.config.password}" | cryptsetup luksFormat ${this.imagepath} -q`, {stdio: 'inherit'});
-            execSync(`echo -n "${this.config.password}" | cryptsetup luksOpen ${this.imagepath} ${this.id}`, { stdio: 'inherit' });
-            execSync(`mkfs.ext4 /dev/mapper/${this.id}`)
-            execSync(`mount /dev/mapper/${this.id} ${this.config.directory}`);
+        if (!fs.existsSync(this.imagepath)) {
+            try {
+                execSync(`dd if=/dev/zero of=${this.imagepath} bs=1M count=${this.config.size}`);
+            } catch (err) {
+                console.error('Error creating disk image:', err);
+            }
 
-            fs.writeFileSync(join(this.config.directory, "_.settings.json"), JSON.stringify({
-                locked : this.config.locked
-            }, null, 2));
-        }else {
-            execSync(`echo -n "${this.config.password}" | cryptsetup luksOpen ${this.imagepath} ${this.id}`, {stdio: 'inherit'});
-            execSync(`mount /dev/mapper/${this.id} ${this.config.directory}`);
+            try {
+                execSync(`echo -n "${this.config.password}" | cryptsetup luksFormat ${this.imagepath} -q`, { stdio: 'inherit' });
+            } catch (err) {
+                console.error('Error formatting LUKS container:', err);
+            }
+
+            try {
+                execSync(`echo -n "${this.config.password}" | cryptsetup luksOpen ${this.imagepath} ${this.id}`, { stdio: 'inherit' });
+            } catch (err) {
+                console.error('Error opening LUKS container:', err);
+            }
+
+            try {
+                execSync(`mkfs.ext4 /dev/mapper/${this.id}`);
+            } catch (err) {
+                console.error('Error creating filesystem:', err);
+            }
+
+            try {
+                execSync(`mount /dev/mapper/${this.id} ${this.config.directory}`);
+            } catch (err) {
+                console.error('Error mounting filesystem:', err);
+            }
+
+            try {
+                fs.writeFileSync(join(this.config.directory, "_.settings.json"), JSON.stringify({
+                    locked: this.config.locked
+                }, null, 2));
+            } catch (err) {
+                console.error('Error writing settings file:', err);
+            }
+
+        } else {
+            try {
+                execSync(`echo -n "${this.config.password}" | cryptsetup luksOpen ${this.imagepath} ${this.id}`, { stdio: 'inherit' });
+            } catch (err) {
+                console.error('Error opening LUKS container:', err);
+            }
+
+            try {
+                execSync(`mount /dev/mapper/${this.id} ${this.config.directory}`);
+            } catch (err) {
+                console.error('Error mounting filesystem:', err);
+            }
         }
 
 
@@ -63,13 +104,7 @@ class Container {
         return this;
     }
     delete(){
-        try{
-            execSync(`umount ${this.config.directory}`, { stdio: 'ignore' })
-        }catch(e){}
-
-        try{
-            execSync(`cryptsetup luksClose ${this.id}`, { stdio: 'ignore' });
-        }catch(e){}
+        this.unmount()
 
         if(fs.existsSync(this.config.directory))
             fs.rmSync(this.config.directory, { recursive: true, force: true });
@@ -79,6 +114,55 @@ class Container {
 
         return this;
     }
+    resize(targetMB: number) {
+        try {
+            // Mount to check usage
+            this.mount();
+            const usedBytes = parseInt(execSync(`du -sb ${this.config.directory}`).toString().split(/\s+/)[0], 10);
+            const usedMB = Math.ceil(usedBytes / (1024 * 1024));
+            const bufferMB = 5;
+            const minMB = usedMB + bufferMB;
+
+            const diskInfo = execSync(`df -B1 ${this.imagepath} | tail -1`).toString().split(/\s+/);
+            const freeBytes = parseInt(diskInfo[3], 10);
+            const freeMB = Math.floor(freeBytes / (1024 * 1024));
+
+            let finalMB = targetMB;
+            if (targetMB < minMB) {
+                console.warn(`Target size too small, resizing to minimum: ${minMB} MB`);
+                finalMB = minMB;
+            } else if (targetMB > freeMB) {
+                throw new Error(`Target size ${targetMB} MB exceeds free disk space ${freeMB} MB`);
+            }
+
+            // Unmount
+            execSync(`umount ${this.config.directory}`, { stdio: 'inherit' });
+
+            // Check if shrinking or growing
+            const currentSizeBytes = parseInt(execSync(`ls -l ${this.imagepath}`).toString().split(/\s+/)[4], 10);
+            const currentSizeMB = Math.ceil(currentSizeBytes / (1024 * 1024));
+            const isShrinking = finalMB < currentSizeMB;
+
+            if (isShrinking) {
+                execSync(`e2fsck -f /dev/mapper/${this.id}`, { stdio: 'inherit' });
+                execSync(`resize2fs /dev/mapper/${this.id} ${finalMB}M`, { stdio: 'inherit' });
+                execSync(`cryptsetup resize ${this.id}`, { stdio: 'inherit' });
+                execSync(`truncate -s ${finalMB}M ${this.imagepath}`, { stdio: 'inherit' });
+            } else {
+                execSync(`truncate -s ${finalMB}M ${this.imagepath}`, { stdio: 'inherit' });
+                execSync(`cryptsetup resize ${this.id}`, { stdio: 'inherit' });
+                execSync(`e2fsck -f /dev/mapper/${this.id}`, { stdio: 'inherit' });
+                execSync(`resize2fs /dev/mapper/${this.id} ${finalMB}M`, { stdio: 'inherit' });
+            }
+
+            // Close and reopen LUKS
+            execSync(`cryptsetup close ${this.id}`, { stdio: 'inherit' });
+            execSync(`cryptsetup luksOpen ${this.imagepath} ${this.id}`, { stdio: 'inherit' });
+        } catch (e:any) {
+            throw new Error(`Resize failed: ${e.message}`);
+        }
+    }
+
 }
 
 export class Luks {
@@ -101,23 +185,34 @@ export class Luks {
         return this;
     }
     delete(force:boolean = false){
+        if(!force)
         this.mount();
-        if(this.container.getSettings().locked && !force)
-            throw new Error(`Container is protected from deletion`);
+        if(this.container.getSettings()?.locked && !force)
+            throw new Error(`The container is protected from deletion. Use force: true to override this protection. This safeguard prevents accidental deletions.`);
 
         this.container.delete();
         return this;
+    }
+    resize(size:number){
+        this.container.resize(size);
     }
 }
 
 let directory : string
     = resolve(__dirname,'./store/mySecretFolder');
 
-new Luks(directory,{
-    size     : 100,
+let luks = new Luks(directory,{
+    size     : 450,
     password : 'b1mujx22',
     locked   : true
-}).delete().mount()
+});
 
-
-//console.log(Luks.list());
+//Luks list will output all containers in array
+//Luks.list();
+// will mount the luks container
+luks.mount();
+// will unmont it
+//luks.unmount();
+// complete delete the container and data (if locked set to true, the method delete will fail if no argument force provided: delete(true))
+//luks.delete(true/* true or false depend on locked property */);
+//luks.resize(250)
