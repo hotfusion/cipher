@@ -1,2 +1,2 @@
-export {Cipher} from "./lib/cipher"
-export {Luks} from "./lib/luks"
+export {Cipher} from "./lib/cipher.ts"
+export {Luks} from "./lib/luks.ts"

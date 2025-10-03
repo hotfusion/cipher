@@ -1,10 +1,9 @@
-import fs from 'fs';
-import crypto from 'crypto';
+import * as fs from 'fs';
+import * as crypto from 'crypto';
 //@ts-ignore
-import Loki from 'lokijs';
-import Ajv from 'ajv';
-import path from "path";
-
+import * as Loki from 'lokijs';
+import * as Ajv from 'ajv';
+import * as path from "path"
 // Custom type definitions for LokiJS 1.5.12
 interface LokiCollection {
     name: string;
@@ -13,6 +12,17 @@ interface LokiCollection {
     findAndRemove(query?: any): void;
     get(id: number): any;
     chain(): { find(query?: any): { simplesort(prop: string, isDesc?: boolean): { data(): any[] } } };
+
+    find(query?: any): any[];
+    insert(doc: any): any;
+    // Add missing methods
+    findOne(query: any): any | null;
+    update(doc: any): void;
+    // Include other existing properties/methods as needed
+    data: any[];
+    idIndex: number[] | null;
+    binaryIndices: { [key: string]: { name: string; dirty: boolean; values: number[] } };
+    uniqueNames: string[];
 }
 
 interface Loki {
@@ -43,6 +53,7 @@ const tagLen = 16;
 
 class EncryptedFsAdapter {
     private password: string;
+    private lastDecryptedContent: string | null = null; // Store decrypted content
 
     constructor(password: string) {
         this.password = password;
@@ -53,14 +64,19 @@ class EncryptedFsAdapter {
     }
 
     loadDatabase(dbname: string, callback: (err: any, data?: string) => void): void {
+        console.log(`Attempting to load database from: ${dbname}`);
+        if (!fs.existsSync(dbname)) {
+            console.log(`Database file ${dbname} does not exist, returning empty DB`);
+            this.lastDecryptedContent = '{}';
+            return callback(null, '{}');
+        }
         fs.readFile(dbname, (err, data) => {
             if (err) {
-                if (err.code === 'ENOENT') {
-                    return callback(null, '{}');
-                }
+                console.error(`Error reading database file ${dbname}:`, err);
                 return callback(err);
             }
             try {
+                console.log(`Reading ${data.length} bytes from ${dbname}`);
                 const salt = data.slice(0, saltLen);
                 const iv = data.slice(saltLen, saltLen + ivLen);
                 const tag = data.slice(saltLen + ivLen, saltLen + ivLen + tagLen);
@@ -70,14 +86,19 @@ class EncryptedFsAdapter {
                 decipher.setAuthTag(tag);
                 let decrypted = decipher.update(encrypted, undefined, 'utf8');
                 decrypted += decipher.final('utf8');
+                console.log(`Decrypted database content: ${decrypted}`);
+                this.lastDecryptedContent = decrypted; // Store decrypted content
                 callback(null, decrypted);
             } catch (e) {
+                console.error(`Error decrypting database ${dbname}:`, e);
                 callback(e);
             }
         });
     }
 
     saveDatabase(dbname: string, dbstring: string, callback: (err?: any) => void): void {
+        console.log(`Attempting to save database to: ${dbname}`);
+        console.log(`Database content to save: ${dbstring}`);
         try {
             const salt = crypto.randomBytes(saltLen);
             const iv = crypto.randomBytes(ivLen);
@@ -87,41 +108,62 @@ class EncryptedFsAdapter {
             encrypted = Buffer.concat([encrypted, cipher.final()]);
             const tag = cipher.getAuthTag();
             const data = Buffer.concat([salt, iv, tag, encrypted]);
-            fs.writeFile(dbname, data, callback);
+            fs.writeFile(dbname, data, (err) => {
+                if (err) {
+                    console.error(`Error writing database to ${dbname}:`, err);
+                    return callback(err);
+                }
+                console.log(`Successfully saved database to ${dbname} (${data.length} bytes)`);
+                if (fs.existsSync(dbname)) {
+                    console.log(`Confirmed database file exists at ${dbname}`);
+                } else {
+                    console.error(`Database file ${dbname} was not created`);
+                }
+                callback(null);
+            });
         } catch (e) {
+            console.error(`Error encrypting database for ${dbname}:`, e);
             callback(e);
         }
+    }
+
+    getLastDecryptedContent(): string | null {
+        return this.lastDecryptedContent;
     }
 }
 
 class CipherCollection {
     private cipher: Cipher;
     private collection: LokiCollection;
-    private ajv: Ajv;
-    private schema: any;
+    private ajv: Ajv.default;
+    private schema: { keySchema?: any };
 
-    constructor(cipher: Cipher, collection: LokiCollection, schema: any) {
+    constructor(cipher: Cipher, collection: LokiCollection, schema: { keySchema?: any }) {
         this.cipher = cipher;
         this.collection = collection;
-        this.ajv = new Ajv({ allErrors: true });
+        this.ajv = new Ajv.default({ allErrors: true });
         this.schema = schema;
     }
 
-    private validateSchema(data: any): void {
-        if (this.schema && Object.keys(this.schema).length > 0) {
-            const validate = this.ajv.compile(this.schema);
-            if (!validate(data)) {
-                throw new Error(`Schema validation failed: ${JSON.stringify(validate.errors)}`);
+    private validateKey(key: any): void {
+        if (this.schema?.keySchema) {
+            const validate = this.ajv.compile(this.schema.keySchema);
+            if (!validate(key)) {
+                throw new Error('Key validation failed: ' + JSON.stringify(validate.errors, null, 2));
             }
         }
     }
 
-    async insert(key: { name: string }, secret: any, meta: { readonly?: boolean; version?: number } = {}): Promise<number> {
+    async insert(key: any, secret: any, meta: { readonly?: boolean; version?: number, __created?: number, __updated?: number } = {}): Promise<number> {
+        meta.__created = Date.now();
+        meta.__updated = Date.now();
         if (!this.cipher.canWrite(meta)) {
             throw new Error('Cannot insert: readonly mode');
         }
-        const name = key.name;
-        const existing = this.collection.find({ name });
+        this.validateKey(key);
+        const id = key.id; // Use key.id as the document's id
+        const keyName = key.keyName || 'id'; // Default to 'id' if keyName not provided
+        const existing = this.collection.find({ id });
         if (existing.length > 0) {
             throw new Error('Key already exists; use update instead');
         }
@@ -129,19 +171,23 @@ class CipherCollection {
         if (version < 1) {
             throw new Error('Version must be at least 1');
         }
-        const doc = { name, secret, version };
-        this.validateSchema(doc);
+        meta.version = version; // Set meta.version to match document version
+        const doc = { id, secret, version, meta, keyName }; // Store keyName in document
+        console.log('Inserting document:', JSON.stringify({ id, version, meta, keyName }, null, 2)); // Debug log (exclude secret)
         const inserted = this.collection.insert(doc);
         await this.cipher.save();
         return inserted.$loki;
     }
 
-    async update(key: { name: string }, secret: any, meta: { readonly?: boolean; version?: number } = {}): Promise<number> {
+    async update(key: any, secret: any, meta: { readonly?: boolean; version?: number, __created?: number, __updated?: number } = {}): Promise<number> {
+        meta.__updated = Date.now();
         if (!this.cipher.canWrite(meta)) {
             throw new Error('Cannot update: readonly mode');
         }
-        const name = key.name;
-        const existing = this.collection.chain().find({ name }).simplesort('version', true).data();
+        this.validateKey(key);
+        const id = key.id;
+        const keyName = key.keyName || 'id';
+        const existing = this.collection.chain().find({ id }).simplesort('version', true).data();
         if (existing.length === 0) {
             throw new Error('Key does not exist; use insert instead');
         }
@@ -150,19 +196,21 @@ class CipherCollection {
         if (version <= maxVersion) {
             throw new Error('Version must be higher than previous');
         }
-        const doc = { name, secret, version };
-        this.validateSchema(doc);
+        meta.version = version; // Set meta.version to match document version
+        const doc = { id, secret, version, meta, keyName };
+        console.log('Updating document:', JSON.stringify({ id, version, meta, keyName }, null, 2)); // Debug log (exclude secret)
         const inserted = this.collection.insert(doc);
         await this.cipher.save();
         return inserted.$loki;
     }
 
-    async delete(key: { name: string }, meta: { readonly?: boolean; version?: number } = {}): Promise<void> {
+    async delete(key: any, meta: { readonly?: boolean; version?: number } = {}): Promise<void> {
         if (!this.cipher.canWrite(meta)) {
             throw new Error('Cannot delete: readonly mode');
         }
-        const name = key.name;
-        const query: any = { name };
+        this.validateKey(key);
+        const id = key.id;
+        const query: any = { id };
         if (meta.hasOwnProperty('version')) {
             query.version = meta.version;
         }
@@ -170,14 +218,23 @@ class CipherCollection {
         await this.cipher.save();
     }
 
-    find(key: { name: string }): { _id: number; name: string } | null {
-        const name = key.name;
-        const existing = this.collection.chain().find({ name }).simplesort('version', true).data();
+    find(key: any): { key: { [key: string]: string }, meta: { version: number, readonly?: boolean }, _id: number } | null {
+        this.validateKey(key);
+        const id = key.id; // Use key.id to locate the document
+        const existing = this.collection.chain().find({ id }).simplesort('version', true).data();
         if (existing.length === 0) {
             return null;
         }
         const latest = existing[existing.length - 1];
-        return { _id: latest.$loki, name: latest.name };
+        const keyName = latest.keyName || 'id'; // Use stored keyName or default to 'id'
+        return {
+            key: { [keyName]: latest.id },
+            meta: {
+                version: latest.version,
+                readonly: latest.meta.readonly
+            },
+            _id: latest.$loki // Include _id for unseal
+        };
     }
 
     unseal(_id: number): any {
@@ -186,6 +243,16 @@ class CipherCollection {
             throw new Error('Document not found');
         }
         return doc.secret;
+    }
+
+    list(): Array<{ key: { [key: string]: string }, meta: { version: number, readonly?: boolean } }> {
+        return this.collection.find().map(doc => ({
+            key: { [doc.keyName || 'id']: doc.id }, // Use stored keyName or default to 'id'
+            meta: {
+                version: doc.version,
+                readonly: doc.meta.readonly
+            }
+        }));
     }
 }
 
@@ -201,17 +268,78 @@ export class Cipher implements Loki {
         const adapter = new EncryptedFsAdapter(settings.password);
         this.collections = new Map();
         this.settings = settings;
-        if(!fs.existsSync(settings.path))
-            fs.mkdirSync(settings.path);
+        console.log(`Ensuring directory exists: ${settings.path}`);
+        if (!fs.existsSync(settings.path)) {
+            fs.mkdirSync(settings.path, { recursive: true });
+            console.log(`Created directory: ${settings.path}`);
+        } else {
+            console.log(`Directory already exists: ${settings.path}`);
+        }
 
-        const lokiInstance = new Loki(`${settings.path}/database.db`, {
+        const lokiInstance = new (Loki.default || Loki)(`${settings.path}/database.db`, {
             adapter,
             autoload: true,
-            autosave: false,
+            autosave: false, // Rely on explicit saves
             autoloadCallback: (err?: any) => {
                 if (err) {
                     console.error('Autoload error:', err);
                     throw err;
+                }
+                // Debug: Log raw database collections
+                const rawCollections = (this as any).lokiInstance.collections
+                    ? (this as any).lokiInstance.collections.map((c: any) => c.name)
+                    : [];
+                console.log('Raw database collections:', rawCollections);
+                // Get decrypted content from adapter
+                const decryptedContent = (adapter as EncryptedFsAdapter).getLastDecryptedContent();
+                let dbContent: any = {};
+                if (decryptedContent) {
+                    try {
+                        dbContent = JSON.parse(decryptedContent);
+                        console.log('Parsed decrypted database content:', JSON.stringify(dbContent.collections?.map((c: any) => c.name) || [], null, 2));
+                    } catch (e) {
+                        console.error('Error parsing decrypted content:', e);
+                        throw e;
+                    }
+                }
+                // Process all collections dynamically
+                if (dbContent.collections) {
+                    for (const col of dbContent.collections) {
+                        // Check if the collection exists in the provided collections array
+                        const collectionConfig = collections.find(c => c.name === col.name);
+                        if (collectionConfig && !this.getCollection(col.name)) {
+                            console.log(`Manually registering collection: ${col.name}`);
+                            const collection = this.addCollection(col.name, {
+                                indices: ['id', 'version'],
+                                unique: ['id'],
+                            });
+                            // Populate collection with deserialized data
+                            if (col.data && Array.isArray(col.data)) {
+                                col.data.forEach((doc: any) => {
+                                    try {
+                                        // Remove $loki to avoid ID conflicts
+                                        const newDoc = { ...doc };
+                                        delete newDoc.$loki;
+                                        // Check if document exists by id
+                                        const existingDoc = collection.findOne({ id: doc.id });
+                                        if (existingDoc) {
+                                            console.log(`Document with id ${doc.id} already exists, updating`);
+                                            Object.assign(existingDoc, newDoc);
+                                            collection.update(existingDoc);
+                                        } else if (doc.id && doc.secret && doc.meta) {
+                                            console.log(`Inserting document with id ${doc.id}`);
+                                            collection.insert(newDoc);
+                                        } else {
+                                            console.log(`Skipping invalid document: ${JSON.stringify(doc)}`);
+                                        }
+                                    } catch (e) {
+                                        console.error(`Error processing document with id ${doc.id || 'unknown'}:`, e);
+                                    }
+                                });
+                                console.log(`Processed ${col.data.length} documents for collection ${col.name}`);
+                            }
+                        }
+                    }
                 }
                 this.databaseInitialize(collections);
                 console.log('Collections initialized:', Array.from(this.collections.keys()));
@@ -219,11 +347,19 @@ export class Cipher implements Loki {
         });
         this.getCollection = lokiInstance.getCollection.bind(lokiInstance);
         this.addCollection = lokiInstance.addCollection.bind(lokiInstance);
-        this.saveDatabase  = lokiInstance.saveDatabase.bind(lokiInstance);
-        // Create a promise that resolves when initialization is complete
+        this.saveDatabase = lokiInstance.saveDatabase.bind(lokiInstance);
+        (this as any).lokiInstance = lokiInstance; // Store for debugging
         this.readyPromise = new Promise((resolve, reject) => {
-            lokiInstance.on('loaded', () => resolve());
-            lokiInstance.on('error', (err:any) => reject(err));
+            lokiInstance.on('loaded', () => {
+                console.log('Database loaded successfully');
+                const allCollections = lokiInstance.listCollections().map((col: any) => col.name);
+                console.log('Collections in database:', allCollections);
+                resolve();
+            });
+            lokiInstance.on('error', (err: any) => {
+                console.error('Database error:', err);
+                reject(err);
+            });
         });
     }
 
@@ -233,10 +369,12 @@ export class Cipher implements Loki {
             if (collection === null) {
                 console.log(`Creating collection: ${col.name}`);
                 collection = this.addCollection(col.name, {
-                    indices: ['name', 'version'],
+                    indices: ['id', 'version'],
+                    unique: ['id'],
                 });
             } else {
                 console.log(`Found existing collection: ${col.name}`);
+                console.log(`Documents in ${col.name}:`, collection.find().length);
             }
             this.collections.set(col.name, { collection, schema: col.schema });
         }
@@ -250,8 +388,13 @@ export class Cipher implements Loki {
     async save(): Promise<void> {
         return new Promise((resolve, reject) => {
             this.saveDatabase((err) => {
-                if (err) reject(err);
-                else resolve();
+                if (err) {
+                    console.error('Save error:', err);
+                    reject(err);
+                } else {
+                    console.log('Database save completed');
+                    resolve();
+                }
             });
         });
     }
@@ -264,7 +407,6 @@ export class Cipher implements Loki {
         return new CipherCollection(this, col.collection, col.schema);
     }
 
-    // Wait for database initialization
     async ready(): Promise<void> {
         return this.readyPromise;
     }
@@ -272,9 +414,10 @@ export class Cipher implements Loki {
 
 
 
-/*
 
-const cipher = new Cipher({
+
+
+/*const cipher = new Cipher({
     size     : 100,
     password : 'b1mujx22',
     path     : path.resolve(__dirname,'./vault/secrets'),
@@ -283,37 +426,37 @@ const cipher = new Cipher({
 }, [{
         name: 'users',
         schema: {
-            type: 'object',
+            name: 'object',
             properties: {
-                name: { type: 'string' },
-                secret: { type: 'object', properties: { password: { type: 'string' } }, required: ['password'] },
-                version: { type: 'number', minimum: 1 }
+                id: { type: 'string' }
             },
             required: ['name', 'secret', 'version']
         }
     }
-]);
+]);*/
 
-async function run() {
+/*async function run() {
     try {
         // Wait for the Cipher instance to be fully initialized
         await cipher.ready();
         const users = cipher.collection('users');
-        const id = await users.insert(
-            { name: 'vadim' },
+        /!*const id = await users.insert(
+            { id: 'vadime', name : 'a' },
             { password: '12345' },
             { readonly: false, version: 1 }
         );
-        console.log(`Inserted vadim, id: ${id}`);
+        console.log(`Inserted vadim, id: ${id}`);*!/
 
-        const found = users.find({ name: 'vadim' });
+        const found = users.find({ id: 'vadime' });
+        console.log(found)
         if (found) {
             const secret = users.unseal(found._id);
             console.log(`Unsealed: ${JSON.stringify(secret)}`);
         }
     } catch (e:any) {
-        console.error(`Error: ${e.message}`);
+        console.error(e);
     }
 }
 
 run();*/
+
