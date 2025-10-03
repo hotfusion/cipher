@@ -1,10 +1,12 @@
+/*
 import { EncryptedFolder } from './luks';
 import pkcs11 from 'pkcs11js';
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import winston from 'winston';
-
+//@ts-ignore
+import * as Loki from 'lokijs'
 interface DBRecord {
     key: Record<string, any>;
     _encrypted: Record<string, Buffer>;
@@ -15,7 +17,7 @@ interface IHSM {
     containerPath: string;
     mountPath: string;
     password: string;
-    hsmPin: string;
+    pin: string;
     hsmSlot?: number;
     maxMemoryMB?: number;
     logLevel?: string;
@@ -33,6 +35,13 @@ export class HSM {
     private logger: winston.Logger;
 
     constructor(options: IHSM) {
+        if (!options.pin) {
+            throw new Error('HSM PIN is required. You must provide hsmPin in options.');
+        }
+
+        if(!fs.existsSync(options.containerPath))
+            fs.mkdirSync(path.dirname(options.containerPath),{recursive:true});
+
         // Initialize logger
         this.logger = winston.createLogger({
             level: options.logLevel || 'info',
@@ -58,18 +67,14 @@ export class HSM {
         this.maxMemoryBytes = (options.maxMemoryMB || 2048) * 1024 * 1024;
 
         this.ensureSoftHSM2Config();
-
-        // Check and install SoftHSM2
         this.ensureSoftHSM2Installed();
 
-        // Initialize token if needed
-        this.ensureTokenInitialized(options.hsmPin, options.hsmSlot || 0);
+        // Initialize token if it doesn't exist, using the PIN provided
+        this.ensureTokenInitialized(options.pin, options.hsmSlot || 0);
 
-        // Initialize SoftHSM2
+        // Load SoftHSM2 library
         this.pkcs11Lib = new pkcs11.PKCS11();
-
         try {
-            // Load SoftHSM2 library
             this.pkcs11Lib.load('/usr/lib/softhsm/libsofthsm2.so');
             this.logger.info('SoftHSM2 library loaded');
         } catch (error) {
@@ -77,43 +82,32 @@ export class HSM {
             throw error;
         }
 
-        // Initialize PKCS#11
         this.pkcs11Lib.C_Initialize();
 
-        // Get list of slots
-        const slots = this.pkcs11Lib.C_GetSlotList(true); // true = only slots with tokens
-        if (!slots.length) {
-            throw new Error('No slots with tokens found');
-        }
+        // Get slot and open session
+        const slots = this.pkcs11Lib.C_GetSlotList(true);
+        if (!slots.length) throw new Error('No slots with tokens found');
 
-        // Pick slot handle based on options.hsmSlot (index)
-        const slotIndex = options.hsmSlot || 0;
-        const slotHandle = slots[slotIndex];
-        if (!slotHandle) {
-            throw new Error(`Slot index ${slotIndex} is invalid`);
-        }
+        const slotHandle = slots[options.hsmSlot || 0];
+        if (!slotHandle) throw new Error(`Slot index ${options.hsmSlot} invalid`);
 
-        // Open session using slot handle
         this.session = this.pkcs11Lib.C_OpenSession(
             slotHandle,
             pkcs11.CKF_SERIAL_SESSION | pkcs11.CKF_RW_SESSION
         );
 
-        // Login to HSM
-        this.pkcs11Lib.C_Login(
-            this.session,
-            pkcs11.CKU_USER,
-            options.hsmPin
-        );
+        try {
+            this.pkcs11Lib.C_Login(this.session, pkcs11.CKU_USER, options.pin);
+        } catch {
+            throw new Error('HSM login failed. Check your hsmPin.');
+        }
 
         this.logger.info('Logged into SoftHSM2');
-
-        // Find or create encryption key
         this.keyHandle = this.findOrCreateKey();
     }
-    /**
+    /!**
      * Ensure SoftHSM2 configuration exists, create if missing
-     */
+     *!/
     private ensureSoftHSM2Config(): void {
         const { execSync } = require('child_process');
         const os = require('os');
@@ -152,9 +146,9 @@ export class HSM {
         process.env.SOFTHSM2_CONF = configPath;
         this.logger.debug(`SOFTHSM2_CONF set to ${configPath}`);
     }
-    /**
+    /!**
      * Check if SoftHSM2 is installed, install if not
-     */
+     *!/
     private ensureSoftHSM2Installed(): void {
         const { execSync } = require('child_process');
 
@@ -176,9 +170,9 @@ export class HSM {
         }
     }
 
-    /**
+    /!**
      * Check if token is initialized, initialize if not
-     */
+     *!/
     private ensureTokenInitialized(pin: string,slot:number): void {
         const { execSync } = require('child_process');
         const crypto = require('crypto');
@@ -214,9 +208,9 @@ export class HSM {
     }
 
 
-    /**
+    /!**
      * Find existing key or create new one in HSM
-     */
+     *!/
     private findOrCreateKey(): Buffer {
         // Try to find existing key
         const template = [
@@ -256,9 +250,9 @@ export class HSM {
         );
     }
 
-    /**
+    /!**
      * Initialize database
-     */
+     *!/
     async initialize(containerSizeMB: number = 512): Promise<void> {
         this.logger.info('Initializing database...');
 
@@ -275,9 +269,6 @@ export class HSM {
                 this.encryptedFolder.close();
             }
 
-            // Load data into memory
-            await this.loadFromDisk();
-
             this.logger.info(`Database loaded: ${this.store.size} records in memory`);
         } catch (error) {
             this.logger.error('Initialization failed', { error });
@@ -285,9 +276,9 @@ export class HSM {
         }
     }
 
-    /**
+    /!**
      * Encrypt data using SoftHSM2
-     */
+     *!/
     private encrypt(plaintext: string): Buffer {
         const plaintextBuffer = Buffer.from(plaintext, 'utf8');
 
@@ -312,9 +303,9 @@ export class HSM {
         return Buffer.concat([iv, encrypted]);
     }
 
-    /**
+    /!**
      * Decrypt data using SoftHSM2
-     */
+     *!/
     private decrypt(ciphertext: Buffer): string {
         // Extract IV and encrypted data
         const iv = ciphertext.subarray(0, 16);
@@ -337,190 +328,17 @@ export class HSM {
         return decrypted.toString('utf8');
     }
 
-    /**
+    /!**
      * Hash key object
-     */
+     *!/
     private hashKey(key: Record<string, any>): string {
         const keyString = JSON.stringify(key, Object.keys(key).sort());
         return crypto.createHash('sha256').update(keyString).digest('hex');
     }
 
-    /**
-     * Insert record
-     */
-    insert(key: Record<string, any>, secret: Record<string, any>): void {
-        const keyHash = this.hashKey(key);
-
-        // Encrypt all secret fields using HSM
-        const encrypted: Record<string, Buffer> = {};
-        for (const [field, value] of Object.entries(secret)) {
-            encrypted[field] = this.encrypt(JSON.stringify(value));
-        }
-
-        const record: DBRecord = {
-            key,
-            _encrypted: encrypted,
-            _timestamp: Date.now()
-        };
-
-        this.store.set(keyHash, record);
-        this.checkMemoryUsage();
-
-        this.logger.debug(`Inserted record with key: ${JSON.stringify(key)}`);
-    }
-
-    /**
-     * Find record by exact key
-     */
-    find(key: Record<string, any>): Record<string, any> | null {
-        const keyHash = this.hashKey(key);
-        const record = this.store.get(keyHash);
-
-        if (!record) {
-            return null;
-        }
-
-        // Decrypt secret fields using HSM
-        const decrypted: Record<string, any> = { ...record.key };
-        for (const [field, encryptedValue] of Object.entries(record._encrypted)) {
-            decrypted[field] = JSON.parse(this.decrypt(encryptedValue));
-        }
-
-        return decrypted;
-    }
-
-    /**
-     * Query records by partial key
-     */
-    query(partialKey: Record<string, any>): Array<Record<string, any>> {
-        const results: Array<Record<string, any>> = [];
-
-        for (const record of this.store.values()) {
-            const matches = Object.entries(partialKey).every(
-                ([field, value]) => record.key[field] === value
-            );
-
-            if (matches) {
-                const decrypted: Record<string, any> = { ...record.key };
-                for (const [field, encryptedValue] of Object.entries(record._encrypted)) {
-                    decrypted[field] = JSON.parse(this.decrypt(encryptedValue));
-                }
-                results.push(decrypted);
-            }
-        }
-
-        return results;
-    }
-
-    /**
-     * Update record
-     */
-    update(key: Record<string, any>, secret: Record<string, any>): boolean {
-        const keyHash = this.hashKey(key);
-        const existing = this.store.get(keyHash);
-
-        if (!existing) {
-            return false;
-        }
-
-        // Re-encrypt secret fields using HSM
-        const encrypted: Record<string, Buffer> = {};
-        for (const [field, value] of Object.entries(secret)) {
-            encrypted[field] = this.encrypt(JSON.stringify(value));
-        }
-
-        existing._encrypted = encrypted;
-        existing._timestamp = Date.now();
-
-        this.logger.debug(`Updated record with key: ${JSON.stringify(key)}`);
-        return true;
-    }
-
-    /**
-     * Delete record
-     */
-    delete(key: Record<string, any>): boolean {
-        const keyHash = this.hashKey(key);
-        const deleted = this.store.delete(keyHash);
-
-        if (deleted) {
-            this.logger.debug(`Deleted record with key: ${JSON.stringify(key)}`);
-        }
-
-        return deleted;
-    }
-
-    /**
-     * Load snapshot from disk
-     */
-    private async loadFromDisk(): Promise<void> {
-        try {
-            this.encryptedFolder.unlock();
-
-            if (fs.existsSync(this.snapshotPath)) {
-                this.logger.debug('Loading snapshot from disk...');
-                const data = fs.readFileSync(this.snapshotPath, 'utf8');
-                const records = JSON.parse(data);
-
-                this.store.clear();
-                for (const record of records) {
-                    // Convert encrypted fields back to Buffers
-                    const encrypted: Record<string, Buffer> = {};
-                    for (const [field, value] of Object.entries(record._encrypted)) {
-                        encrypted[field] = Buffer.from(value as any, 'base64');
-                    }
-                    record._encrypted = encrypted;
-
-                    const keyHash = this.hashKey(record.key);
-                    this.store.set(keyHash, record);
-                }
-
-                this.logger.info(`Loaded ${records.length} records into memory`);
-            }
-
-            this.encryptedFolder.close();
-        } catch (error) {
-            this.logger.error('Failed to load from disk', { error });
-            this.encryptedFolder.cleanup();
-            throw error;
-        }
-    }
-
-    /**
-     * Save snapshot to disk
-     */
-    async saveToDisk(): Promise<void> {
-        this.logger.debug('Saving snapshot to disk...');
-
-        try {
-            this.encryptedFolder.unlock();
-
-            if (!fs.existsSync(this.dbPath)) {
-                fs.mkdirSync(this.dbPath, { recursive: true });
-            }
-
-            // Convert Buffers to base64 for JSON
-            const records = Array.from(this.store.values()).map(record => ({
-                ...record,
-                _encrypted: Object.fromEntries(
-                    Object.entries(record._encrypted).map(([k, v]) => [k, v.toString('base64')])
-                )
-            }));
-
-            fs.writeFileSync(this.snapshotPath, JSON.stringify(records, null, 2));
-            this.encryptedFolder.close();
-
-            this.logger.info(`Saved ${records.length} records to disk`);
-        } catch (error) {
-            this.logger.error('Failed to save to disk', { error });
-            this.encryptedFolder.cleanup();
-            throw error;
-        }
-    }
-
-    /**
+    /!**
      * Get stats
-     */
+     *!/
     getStats(): {
         recordCount: number;
         estimatedMemoryMB: number;
@@ -544,51 +362,72 @@ export class HSM {
         }
     }
 
-    /**
+    /!**
      * Shutdown
-     */
+     *!/
     async shutdown(): Promise<void> {
         this.logger.info('Shutting down database...');
-
-        await this.saveToDisk();
-
         // Logout and close HSM session
         this.pkcs11Lib.C_Logout(this.session);
         this.pkcs11Lib.C_CloseSession(this.session);
         this.pkcs11Lib.C_Finalize();
-
         this.logger.info('Database shutdown complete');
     }
 }
 
-
+import {execSync} from "child_process";
 
 (async () => {
-    const db = new HSM({
-        containerPath: './cipher.img',
-        mountPath: path.resolve(__dirname,'./testFolder'),
-        password: 'disk-password1',
-        hsmPin: '1234',
-        hsmSlot: 0,
-        maxMemoryMB: 2048,
-        logLevel: 'debug'
+    const hsm = new HSM({
+        containerPath : path.resolve(__dirname,'./_.store/cipher.img'),
+        mountPath     : path.resolve(__dirname,'./secret-folder'),
+        password      : 'disk-password12',
+        pin           : '1234',
+        hsmSlot       : 0,
+        maxMemoryMB   : 2048,
+        logLevel      : 'debug'
     });
 
     // Initialize
-    await db.initialize(512);
+    await hsm.initialize(512);
 
-    // Insert - secrets encrypted by HSM
-    db.insert(
-        { name: 'olga' },
-        { password: '1234567', credit_card: '1234123412341234' }
-    );
 
-    // Find - decrypted by HSM
-    const user = db.find({ name: 'olga' });
-    console.log('Found:', user);
+    const check = execSync(`mount | grep ${path.resolve(__dirname,'./secret-folder/database.db')} || true`).toString();
+    if (!check.includes(path.resolve(__dirname,'./secret-folder/database.db'))) {
+        throw new Error('Encrypted folder is NOT mounted — Loki will leak secrets!');
+    }
+
+// create database instance (in-memory, but can be saved later)
+    const db = new Loki.default(path.resolve(__dirname,'./secret-folder/database.db'), {
+        autoload: true,               // load if exists
+        autoloadCallback: databaseInitialize,
+        autosave: true,               // auto save
+        autosaveInterval: 4000        // every 4s
+    });
+
+    function databaseInitialize() {
+        let users = db.getCollection('users');
+
+        if (users === null) {
+            users = db.addCollection('users'); // create if not exists
+        }
+
+        // Insert some data
+        users.insert({ name: 'Alice', age: 30 });
+        users.insert({ name: 'Bob', age: 25 });
+        users.insert({ name: 'Charlie', age: 35 });
+
+        // Query data
+        const result = users.find({ age: { '$gt': 26 } });
+        console.log('Users over 26:', result);
+
+        // Save database explicitly (optional if autosave is on)
+        //db.saveDatabase();
+    }
 
     // Save and shutdown
-    await db.saveToDisk();
-    await db.shutdown();
+    //await db.saveToDisk();
+    //await db.shutdown();
 })()
 
+*/

@@ -1,0 +1,45 @@
+[Start]
+   │
+   ▼
+[Create .img file]
+   │  dd if=/dev/urandom of=cipher.img bs=1M count=1024
+   │
+   ▼
+[Setup LUKS]
+   │  sudo cryptsetup luksFormat cipher.img
+   │
+   ▼
+[Open LUKS container]
+   │  sudo cryptsetup luksOpen cipher.img secureDisk
+   │
+   ▼
+[Create filesystem inside]
+   │  sudo mkfs.ext4 /dev/mapper/secureDisk
+   │
+   ▼
+[Mount filesystem]
+   │  mkdir ~/secret-folder
+   │  sudo mount /dev/mapper/secureDisk ~/secret-folder
+   │
+   ▼
+[Use container]
+   │  # read/write files inside ~/secret-folder
+   │
+   ▼
+[Stop using container]
+   │  # make sure no processes are inside
+   │
+   ▼
+[Unmount filesystem]
+   │  sudo umount -l ~/secret-folder
+   │
+   ▼
+[Close LUKS container]
+   │  sudo cryptsetup luksClose secureDisk
+   │
+   ▼
+[Optional: Delete .img file]
+   │  rm cipher.img
+   │
+   ▼
+[End]
