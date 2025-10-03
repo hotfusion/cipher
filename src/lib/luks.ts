@@ -1,7 +1,6 @@
 import {execSync} from "child_process";
 import * as fs from "fs";
 import {basename, resolve,dirname,join}  from "path"
-import {config} from "winston";
 interface IContainer {
     size : number
     directory : string
