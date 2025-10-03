@@ -5,7 +5,8 @@
   "main": "src/index.ts",
   "scripts": {
     "luks" : "sudo ts-node src/lib/luks.ts",
-    "cipher" : "sudo ts-node src/lib/cipher.ts"
+    "cipher" : "sudo ts-node src/lib/cipher.ts",
+    "clean": "gulp clean"
   },
   "repository": {
     "type": "git",
@@ -19,5 +20,9 @@
     "winston" : "^3.18.3",
     "pkcs11js" : "^2.1.6",
     "lokijs" : "^1.5.12"
+  },
+  "devDependencies": {
+    "gulp": "^5.0.1",
+    "through2" : "^4.0.2"
   }
 }

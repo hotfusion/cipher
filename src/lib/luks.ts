@@ -197,21 +197,23 @@ export class Luks {
     }
 }
 
-let directory : string
+
+/*let directory : string
     = resolve(__dirname,'./vault/secrets');
 
 let luks = new Luks(directory,{
     size     : 450,
     password : 'b1mujx22',
     locked   : true
-});
+});*/
 
-//Luks list will output all containers in array
-//Luks.list();
+
+// Luks list will output all containers in array
+// Luks.list();
 // will mount the luks container
-//luks.mount();
+// luks.mount();
 // will unmont it
-//luks.unmount();
+// luks.unmount();
 // complete delete the container and data (if locked set to true, the method delete will fail if no argument force provided: delete(true))
-//luks.delete(true/* true or false depend on locked property */);
-//luks.resize(250)
+// luks.delete(true/* true or false depend on locked property */);
+// luks.resize(250)

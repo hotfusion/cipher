@@ -31,7 +31,7 @@ interface ICipher {
 }
 
 interface ICollection {
-    name: 'users';
+    name: string;
     schema: any;
 }
 
@@ -189,7 +189,7 @@ class CipherCollection {
     }
 }
 
-class Cipher implements Loki {
+export class Cipher implements Loki {
     private settings: ICipher;
     private collections: Map<string, { collection: LokiCollection; schema: any }>;
     private readyPromise: Promise<void>;
