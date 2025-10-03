@@ -209,7 +209,7 @@ let luks = new Luks(directory,{
 //Luks list will output all containers in array
 //Luks.list();
 // will mount the luks container
-luks.mount();
+//luks.mount();
 // will unmont it
 //luks.unmount();
 // complete delete the container and data (if locked set to true, the method delete will fail if no argument force provided: delete(true))

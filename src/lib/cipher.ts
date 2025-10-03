@@ -269,6 +269,11 @@ class Cipher implements Loki {
         return this.readyPromise;
     }
 }
+
+
+
+/*
+
 const cipher = new Cipher({
     size     : 100,
     password : 'b1mujx22',
@@ -311,4 +316,4 @@ async function run() {
     }
 }
 
-run();
+run();*/
