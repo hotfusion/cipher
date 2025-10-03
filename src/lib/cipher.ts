@@ -3,6 +3,7 @@ import crypto from 'crypto';
 //@ts-ignore
 import Loki from 'lokijs';
 import Ajv from 'ajv';
+import path from "path";
 
 // Custom type definitions for LokiJS 1.5.12
 interface LokiCollection {
@@ -19,8 +20,6 @@ interface Loki {
     addCollection(name: string, options?: any): LokiCollection;
     saveDatabase(callback: (err?: any) => void): void;
 }
-
-// Override LokiJS module declaration
 
 
 interface ICipher {
@@ -43,7 +42,7 @@ const saltLen = 16;
 const tagLen = 16;
 
 class EncryptedFsAdapter {
-    private readonly password: string;
+    private password: string;
 
     constructor(password: string) {
         this.password = password;
@@ -193,35 +192,51 @@ class CipherCollection {
 class Cipher implements Loki {
     private settings: ICipher;
     private collections: Map<string, { collection: LokiCollection; schema: any }>;
-    // Explicitly declare Loki methods
+    private readyPromise: Promise<void>;
     getCollection: (name: string) => LokiCollection | null;
     addCollection: (name: string, options?: any) => LokiCollection;
     saveDatabase: (callback: (err?: any) => void) => void;
 
     constructor(settings: ICipher, collections: ICollection[] = [{ name: 'users', schema: {} }]) {
         const adapter = new EncryptedFsAdapter(settings.password);
-        // Call Loki constructor
+        this.collections = new Map();
+        this.settings = settings;
+        if(!fs.existsSync(settings.path))
+            fs.mkdirSync(settings.path);
+
         const lokiInstance = new Loki(`${settings.path}/database.db`, {
             adapter,
             autoload: true,
-            autoloadCallback: () => this.databaseInitialize(collections),
             autosave: false,
+            autoloadCallback: (err?: any) => {
+                if (err) {
+                    console.error('Autoload error:', err);
+                    throw err;
+                }
+                this.databaseInitialize(collections);
+                console.log('Collections initialized:', Array.from(this.collections.keys()));
+            }
         });
-        // Assign Loki methods to this instance
         this.getCollection = lokiInstance.getCollection.bind(lokiInstance);
         this.addCollection = lokiInstance.addCollection.bind(lokiInstance);
-        this.saveDatabase = lokiInstance.saveDatabase.bind(lokiInstance);
-        this.settings = settings;
-        this.collections = new Map();
+        this.saveDatabase  = lokiInstance.saveDatabase.bind(lokiInstance);
+        // Create a promise that resolves when initialization is complete
+        this.readyPromise = new Promise((resolve, reject) => {
+            lokiInstance.on('loaded', () => resolve());
+            lokiInstance.on('error', (err:any) => reject(err));
+        });
     }
 
     private databaseInitialize(collections: ICollection[]): void {
         for (const col of collections) {
             let collection = this.getCollection(col.name);
             if (collection === null) {
+                console.log(`Creating collection: ${col.name}`);
                 collection = this.addCollection(col.name, {
                     indices: ['name', 'version'],
                 });
+            } else {
+                console.log(`Found existing collection: ${col.name}`);
             }
             this.collections.set(col.name, { collection, schema: col.schema });
         }
@@ -248,4 +263,52 @@ class Cipher implements Loki {
         }
         return new CipherCollection(this, col.collection, col.schema);
     }
+
+    // Wait for database initialization
+    async ready(): Promise<void> {
+        return this.readyPromise;
+    }
 }
+const cipher = new Cipher({
+    size     : 100,
+    password : 'b1mujx22',
+    path     : path.resolve(__dirname,'./vault/secrets'),
+    locked   : true,
+    readonly : true
+}, [{
+        name: 'users',
+        schema: {
+            type: 'object',
+            properties: {
+                name: { type: 'string' },
+                secret: { type: 'object', properties: { password: { type: 'string' } }, required: ['password'] },
+                version: { type: 'number', minimum: 1 }
+            },
+            required: ['name', 'secret', 'version']
+        }
+    }
+]);
+
+async function run() {
+    try {
+        // Wait for the Cipher instance to be fully initialized
+        await cipher.ready();
+        const users = cipher.collection('users');
+        const id = await users.insert(
+            { name: 'vadim' },
+            { password: '12345' },
+            { readonly: false, version: 1 }
+        );
+        console.log(`Inserted vadim, id: ${id}`);
+
+        const found = users.find({ name: 'vadim' });
+        if (found) {
+            const secret = users.unseal(found._id);
+            console.log(`Unsealed: ${JSON.stringify(secret)}`);
+        }
+    } catch (e:any) {
+        console.error(`Error: ${e.message}`);
+    }
+}
+
+run();

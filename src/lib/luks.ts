@@ -199,7 +199,7 @@ export class Luks {
 }
 
 let directory : string
-    = resolve(__dirname,'./store/mySecretFolder');
+    = resolve(__dirname,'./vault/secrets');
 
 let luks = new Luks(directory,{
     size     : 450,

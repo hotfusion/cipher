@@ -4,7 +4,8 @@
   "description": "",
   "main": "src/index.ts",
   "scripts": {
-    "luks" : "sudo ts-node src/lib/luks.ts"
+    "luks" : "sudo ts-node src/lib/luks.ts",
+    "cipher" : "sudo ts-node src/lib/cipher.ts"
   },
   "repository": {
     "type": "git",
